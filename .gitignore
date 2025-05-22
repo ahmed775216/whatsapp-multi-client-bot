@@ -1,0 +1,19 @@
+# Node modules
+node_modules/
+
+# Session files - IMPORTANT to keep these private
+*.json
+auth_info_baileys/
+
+# Environment variables file
+.env
+
+# Log files
+*.log
+
+# Temporary files
+tmp/
+
+# OS generated files
+.DS_Store
+Thumbs.db
