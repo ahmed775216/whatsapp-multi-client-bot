@@ -51,14 +51,12 @@ function connectToManagerWebSocket() {
 
     managerWsClient.onopen = () => {
         console.log(`[${CLIENT_ID}] Connected to manager WS.`);
-        // Report initial status to manager, manager will forward to C#
+        // --- CRITICAL: Identify self as bot with initial status ---
         reportStatusToManager('status', {
             status: 'connecting',
             message: `Client ${CLIENT_ID} bot instance started, attempting WhatsApp connection.`,
-            clientId: CLIENT_ID,
         });
     };
-
     managerWsClient.onmessage = (event) => {
         // Manager might send commands back (e.g., 'stop')
         console.log(`[${CLIENT_ID}] Received command from manager: ${event.data}`);
