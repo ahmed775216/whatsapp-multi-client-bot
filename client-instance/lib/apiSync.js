@@ -1,8 +1,9 @@
 // client-instance/lib/apiSync.js
 const fetch = require('node-fetch');
+const path = require('path');
 
 const { formatJid, addToWhitelist, removeFromWhitelist, saveUserGroupPermissionsFile } = require('../plugins/whitelist');
-const config = require('../../config'); // Import shared config to get DEFAULT_PHONE_COUNTRY_CODE
+const config = require('../../config');
 
 const API_BASE_URL = process.env.API_BASE_URL;
 const API_LOGIN_ENDPOINT = `${API_BASE_URL}/login`;
@@ -24,29 +25,16 @@ if (!global.userGroupPermissions) {
     // For now, whitelist.js will handle its own initialization when required for its functions.
 }
 
-/**
- * Ensures a phone number is in full JID format with country code.
- * @param {string} mobileNumber - The phone number from the API (e.g., "771234567").
- * @returns {string} - Full JID (e.g., "967771234567@s.whatsapp.net").
- */
 function normalizePhoneNumberToJid(mobileNumber) {
-    let cleanedNumber = mobileNumber.replace(/\D/g, ''); // Remove non-digits
+    let cleanedNumber = mobileNumber.replace(/\D/g, '');
     
-    // Check if the number already starts with the country code (or '00' then country code)
     if (!cleanedNumber.startsWith(config.DEFAULT_PHONE_COUNTRY_CODE) && !cleanedNumber.startsWith('00' + config.DEFAULT_PHONE_COUNTRY_CODE)) {
         cleanedNumber = config.DEFAULT_PHONE_COUNTRY_CODE + cleanedNumber;
     }
     
-    return formatJid(cleanedNumber); // formatJid already adds @s.whatsapp.net
+    return formatJid(cleanedNumber);
 }
 
-/**
- * Strips the country code from a JID's number part, if present,
- * for sending to an API that expects local numbers.
- * @param {string} fullJid - The full JID (e.g., "967771234567@s.whatsapp.net").
- * @param {string} countryCode - The country code to strip (e.g., '967').
- * @returns {string} - The local number (e.g., "771234567").
- */
 function stripCountryCode(fullJid, countryCode) {
     const numberPart = fullJid.split('@')[0];
     if (numberPart.startsWith(countryCode)) {
@@ -61,6 +49,8 @@ function stripCountryCode(fullJid, countryCode) {
  */
 async function loginToApi() {
     console.log(`[${process.env.CLIENT_ID}_API_SYNC] Attempting login to external API...`);
+    console.log(`[${process.env.CLIENT_ID}_API_SYNC] Using username: ${CLIENT_API_USERNAME ? CLIENT_API_USERNAME.substring(0, 3) + '***' : 'N/A'}`);
+    
     if (!CLIENT_API_USERNAME || !CLIENT_API_PASSWORD) {
         console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] API username or password not set for this client instance. Skipping API login.`);
         return null;
@@ -69,29 +59,62 @@ async function loginToApi() {
     try {
         const response = await fetch(API_LOGIN_ENDPOINT, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'User-Agent': 'WhatsApp-Bot-Client'
+            },
             body: JSON.stringify({
                 username: CLIENT_API_USERNAME,
                 password: CLIENT_API_PASSWORD,
             }),
+            redirect: 'manual' // Prevent automatic redirects
         });
 
+        console.log(`[${process.env.CLIENT_ID}_API_SYNC] Login API response status: ${response.status}`);
+        console.log(`[${process.env.CLIENT_ID}_API_SYNC] Login API response headers:`, Object.fromEntries(response.headers.entries()));
+        
+        // Handle redirects manually
+        if (response.status >= 300 && response.status < 400) {
+            const location = response.headers.get('location');
+            console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Login endpoint redirected to: ${location}`);
+            console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] This suggests the API endpoint URL might be incorrect.`);
+            return null;
+        }
+        
         if (!response.ok) {
             const errorText = await response.text();
-            console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Login failed: ${response.status} - ${errorText}`);
+            console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Login failed: ${response.status} - ${errorText.substring(0, 500)}`);
+            
+            // Check if response indicates HTML, which means wrong endpoint or redirect
+            if (errorText.includes('<!DOCTYPE html>') || errorText.includes('<html')) {
+                console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Login response is HTML - likely wrong endpoint or server redirect.`);
+                console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Check if the API_BASE_URL is correct: ${API_BASE_URL}`);
+            }
+            return null;
+        }
+
+        const contentType = response.headers.get('content-type');
+        if (!contentType || !contentType.includes('application/json')) {
+            const responseText = await response.text();
+            console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Login response is not JSON. Content-Type: ${contentType}`);
+            console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Response: ${responseText.substring(0, 200)}...`);
             return null;
         }
 
         const data = await response.json();
         if (data.token) {
             apiToken = data.token;
-            console.log(`[${process.env.CLIENT_ID}_API_SYNC] Login successful, token obtained.`);
+            console.log(`[${process.env.CLIENT_ID}_API_SYNC] Login successful, token obtained. Token Length: ${apiToken.length > 0 ? 'Set' : 'Empty'}`);
             return apiToken;
         }
-        console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Login response missing token or malformed:`, data);
+        console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Login response missing token:`, JSON.stringify(data).substring(0, 200) + '...');
         return null;
     } catch (error) {
         console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Error during API login:`, error.message);
+        if (error.stack) {
+            console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Stack trace:`, error.stack);
+        }
         return null;
     }
 }
@@ -109,31 +132,70 @@ async function syncWhitelistFromApi() {
     }
 
     if (!apiToken) {
-        console.log(`[${process.env.CLIENT_ID}_API_SYNC] No token, attempting login first.`);
+        console.log(`[${process.env.CLIENT_ID}_API_SYNC] No token available for sync, attempting login first.`);
         if (!(await loginToApi())) {
             console.error(`[${process.env.CLIENT_ID}_API_SYNC] Login failed, aborting sync.`);
             return;
         }
+    } else {
+        console.log(`[${process.env.CLIENT_ID}_API_SYNC] API token already exists.`);
     }
 
     try {
-        console.log(`[${process.env.CLIENT_ID}_API_SYNC] Fetching contacts from API...`);
+        console.log(`[${process.env.CLIENT_ID}_API_SYNC] Fetching contacts from API endpoint: ${API_GET_CONTACTS_ENDPOINT}`);
         const response = await fetch(API_GET_CONTACTS_ENDPOINT, {
-            headers: { 'Authorization': `Bearer ${apiToken}`, 'Content-Type': 'application/json' },
+            method: 'GET',
+            headers: { 
+                'Authorization': `Bearer ${apiToken}`,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'User-Agent': 'WhatsApp-Bot-Client'
+            },
+            redirect: 'manual' // Prevent automatic redirects
         });
+        
+        console.log(`[${process.env.CLIENT_ID}_API_SYNC] Get contacts API response status: ${response.status}`);
+        console.log(`[${process.env.CLIENT_ID}_API_SYNC] Get contacts API response headers:`, Object.fromEntries(response.headers.entries()));
+        
+        // Handle redirects manually
+        if (response.status >= 300 && response.status < 400) {
+            const location = response.headers.get('location');
+            console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Get contacts endpoint redirected to: ${location}`);
+            console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] This suggests the API endpoint URL might be incorrect or token is invalid.`);
+            apiToken = null; // Clear token to force re-login
+            return;
+        }
+        
         if (!response.ok) {
             const errorText = await response.text();
-            console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Fetch contacts failed: ${response.status} - ${errorText}`);
+            console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Fetch contacts failed: ${response.status} - ${errorText.substring(0, 500)}`);
+            
             if (response.status === 401 || response.status === 403) {
-                console.warn(`[${process.env.CLIENT_ID}_API_SYNC] Token might be invalid for fetching contacts. Clearing token.`);
+                console.warn(`[${process.env.CLIENT_ID}_API_SYNC] Token might be invalid for fetching contacts. Clearing token to force re-login.`);
                 apiToken = null;
+            }
+            
+            // Check if response indicates HTML
+            if (errorText.includes('<!DOCTYPE html>') || errorText.includes('<html')) {
+                console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Get contacts response is HTML - likely wrong endpoint or server redirect.`);
+                console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Check if the API_BASE_URL is correct: ${API_BASE_URL}`);
             }
             return;
         }
+
+        const contentType = response.headers.get('content-type');
+        if (!contentType || !contentType.includes('application/json')) {
+            const responseText = await response.text();
+            console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Get contacts response is not JSON. Content-Type: ${contentType}`);
+            console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Response: ${responseText.substring(0, 200)}...`);
+            return;
+        }
+
         const data = await response.json();
+        console.log(`[${process.env.CLIENT_ID}_API_SYNC] Raw API contact data (first 500 chars): ${JSON.stringify(data).substring(0, 500)}...`);
 
         if (!data || !data.status || !Array.isArray(data.contacts)) {
-            console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Invalid contacts API response structure.`, data);
+            console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Invalid contacts API response structure. Expected 'status' and 'contacts' array. Received:`, JSON.stringify(data).substring(0, 200) + '...');
             return;
         }
 
@@ -144,8 +206,9 @@ async function syncWhitelistFromApi() {
 
         for (const contact of contactsArray) {
             if (contact.mobile) {
-                const jid = normalizePhoneNumberToJid(contact.mobile); // Use the new normalization function here
+                const jid = normalizePhoneNumberToJid(contact.mobile);
                 apiUserJidsProcessed.add(jid);
+                console.log(`[${process.env.CLIENT_ID}_API_SYNC_DETAIL] Processing contact: Mobile=${contact.mobile}, Normalized JID=${jid}, Active=${contact.active}`);
 
                 if (contact.active === true) {
                     const addResult = addToWhitelist(jid);
@@ -153,6 +216,7 @@ async function syncWhitelistFromApi() {
                         if (global.userGroupPermissions[jid] !== contact.allowed_in_groups) {
                             global.userGroupPermissions[jid] = contact.allowed_in_groups;
                             updatedUserPerms++;
+                            console.log(`[${process.env.CLIENT_ID}_API_SYNC_DETAIL] Updated group permission for ${jid} to ${contact.allowed_in_groups}`);
                         }
                     } else {
                         console.warn(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Failed to add active user ${jid} to general whitelist: ${addResult.reason}`);
@@ -161,16 +225,21 @@ async function syncWhitelistFromApi() {
                     const removalResult = removeFromWhitelist(jid);
                     if (removalResult.success) {
                         console.log(`[${process.env.CLIENT_ID}_API_SYNC_DETAIL] User ${jid} inactive in API, removed.`);
+                    } else if (removalResult.reason === 'not_whitelisted') {
+                        console.log(`[${process.env.CLIENT_ID}_API_SYNC_DETAIL] User ${jid} inactive in API, but not found in bot's whitelist.`);
                     }
                 }
+            } else {
+                console.warn(`[${process.env.CLIENT_ID}_API_SYNC_WARNING] API contact missing mobile number:`, contact);
             }
         }
         
         const currentBotWhitelistedUsers = [...global.whitelist.users];
+        console.log(`[${process.env.CLIENT_ID}_API_SYNC_DETAIL] Checking for users to remove from bot's whitelist (not in API list). Current count: ${currentBotWhitelistedUsers.length}`);
         for (const botUserJid of currentBotWhitelistedUsers) {
             if (!apiUserJidsProcessed.has(botUserJid) && botUserJid.endsWith('@s.whatsapp.net')) {
+                console.log(`[${process.env.CLIENT_ID}_API_SYNC_DETAIL] User ${botUserJid} found in bot's whitelist but not in API list. Removing.`);
                 removeFromWhitelist(botUserJid);
-                console.log(`[${process.env.CLIENT_ID}_API_SYNC_DETAIL] User ${botUserJid} no longer in API list, removed from bot's whitelist and group permissions.`);
             }
         }
 
@@ -184,8 +253,11 @@ async function syncWhitelistFromApi() {
         }
 
     } catch (error) {
-        console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Error during whitelist sync:`, error);
+        console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Error during whitelist sync:`, error.message);
+        if (error.stack) {
+            console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Stack trace:`, error.stack);
+        }
     }
 }
 
-module.exports = { syncWhitelistFromApi, getApiToken: () => apiToken, stripCountryCode }; // Export getApiToken and stripCountryCode
+module.exports = { syncWhitelistFromApi, getApiToken: () => apiToken, stripCountryCode };

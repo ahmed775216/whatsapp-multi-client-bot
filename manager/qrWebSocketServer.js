@@ -16,14 +16,23 @@ let onQrRequestedCallback = null;
 let onManualRelinkCallback = null;
 let onIncomingClientStatusCallback = null;
 let onIncomingClientQrCallback = null;
-// Removed onActivateClientWithApiCallback
+let onListInstancesCallback = null;
+let onStartInstanceCallback = null;
+let onStopInstanceCallback = null;
+let onRestartInstanceCallback = null;
+let onGetLogsCallback = null;
+
 
 function startWebSocketServer(port, callbacks = {}) {
     onQrRequestedCallback = callbacks.onQrRequested;
     onManualRelinkCallback = callbacks.onManualRelink;
     onIncomingClientStatusCallback = callbacks.onIncomingClientStatus;
     onIncomingClientQrCallback = callbacks.onIncomingClientQr;
-    // Removed onActivateClientWithApiCallback assignment
+    onListInstancesCallback = callbacks.onListInstances;
+    onStartInstanceCallback = callbacks.onStartInstance;
+    onStopInstanceCallback = callbacks.onStopInstance;
+    onRestartInstanceCallback = callbacks.onRestartInstance;
+    onGetLogsCallback = callbacks.onGetLogs;
 
     if (wss) { console.warn("[MGR_QR_WS] WebSocket server already running."); return; }
 
@@ -45,8 +54,11 @@ function startWebSocketServer(port, callbacks = {}) {
                 ws.close(1008, "Invalid initial message format"); return;
             }
 
-            // C# UI app connection
-            if (parsedMsg.type === 'requestQr' || parsedMsg.type === 'manualRelink') {
+            if (parsedMsg.type === 'requestQr' || parsedMsg.type === 'manualRelink' ||
+                parsedMsg.type === 'listInstances' || parsedMsg.type === 'startInstance' ||
+                parsedMsg.type === 'stopInstance' || parsedMsg.type === 'restartInstance' ||
+                parsedMsg.type === 'getLogs')
+            {
                 if (csharpClientWs && csharpClientWs.readyState === WebSocket.OPEN && csharpClientWs !== ws) {
                     console.warn(`[MGR_QR_WS] Another C# UI client (${clientIP}) attempted to connect. Closing extra.`);
                     ws.close(1008, "Only one UI client allowed"); return;
@@ -55,19 +67,10 @@ function startWebSocketServer(port, callbacks = {}) {
                 console.log(`[MGR_QR_WS] Designated C# UI client connected from ${clientIP}.`);
                 csharpClientWs.send(JSON.stringify({ type: 'status', ...managerQrState }));
 
-                // Extract API credentials from the message
-                const apiUsername = parsedMsg.apiUsername || null;
-                const apiPassword = parsedMsg.apiPassword || null;
-
-                if (parsedMsg.type === 'requestQr' && onQrRequestedCallback) {
-                    onQrRequestedCallback(apiUsername, apiPassword); // Pass credentials
-                } else if (parsedMsg.type === 'manualRelink' && onManualRelinkCallback) {
-                    onManualRelinkCallback(apiUsername, apiPassword); // Pass credentials
-                }
+                handleCSharpUiCommand(ws, parsedMsg);
                 
-                ws.on('message', handleCSharpUiMessage);
+                ws.on('message', (subsequentMessage) => handleCSharpUiCommand(ws, JSON.parse(subsequentMessage.toString())));
             }
-            // Client Bot Instance connection
             else if (parsedMsg.clientId && parsedMsg.type && parsedMsg.data) {
                 const { clientId, data } = parsedMsg;
                 console.log(`[MGR_QR_WS] Client Bot Instance ${clientId} connected from ${clientIP}.`);
@@ -107,15 +110,34 @@ function startWebSocketServer(port, callbacks = {}) {
     wss.on('error', (error) => console.error('[MGR_QR_WS] WebSocket Server Error (fatal):', error));
 }
 
-function handleCSharpUiMessage(message) {
-    const msgStr = message.toString();
-    try {
-        const parsedMsg = JSON.parse(msgStr);
-        // If C# UI sends subsequent commands other than initial request/relink
-        // They would be handled here. No new commands needed for this flow.
-        console.warn(`[MGR_QR_WS] Unhandled subsequent message type from C# UI: ${parsedMsg.type}`);
-    } catch (e) {
-        console.error(`[MGR_QR_WS] Failed to parse subsequent message from C# UI:`, e);
+function handleCSharpUiCommand(ws, parsedMsg) {
+    const { type, clientId, apiUsername, apiPassword, ownerNumber, ...otherData } = parsedMsg; // NEW: Extract ownerNumber
+
+    switch (type) {
+        case 'requestQr':
+            if (onQrRequestedCallback) onQrRequestedCallback(apiUsername, apiPassword, ownerNumber); // NEW: Pass ownerNumber
+            break;
+        case 'manualRelink':
+            if (onManualRelinkCallback) onManualRelinkCallback(apiUsername, apiPassword, ownerNumber); // NEW: Pass ownerNumber
+            break;
+        case 'listInstances':
+            if (onListInstancesCallback) onListInstancesCallback(ws);
+            break;
+        case 'startInstance':
+            if (onStartInstanceCallback && clientId) onStartInstanceCallback(clientId);
+            break;
+        case 'stopInstance':
+            if (onStopInstanceCallback && clientId) onStopInstanceCallback(clientId);
+            break;
+        case 'restartInstance':
+            if (onRestartInstanceCallback && clientId) onRestartInstanceCallback(clientId);
+            break;
+        case 'getLogs':
+            if (onGetLogsCallback && clientId) onGetLogsCallback(ws, clientId);
+            break;
+        default:
+            console.warn(`[MGR_QR_WS] Unhandled message type from C# UI: ${type}`);
+            break;
     }
 }
 
@@ -173,6 +195,32 @@ function updateManagerQrState(status, message, qr = null, clientId = null, phone
     }
 }
 
+function notifyInstanceStatusChange(clientId, status, phoneNumber = null, name = null) {
+    const payload = {
+        type: 'instanceStatusUpdate',
+        clientId: clientId,
+        status: status,
+        phoneNumber: phoneNumber,
+        name: name,
+        timestamp: new Date().toISOString()
+    };
+    if (csharpClientWs && csharpClientWs.readyState === WebSocket.OPEN) {
+        csharpClientWs.send(JSON.stringify(payload));
+        console.log(`[MGR_QR_WS] Notified C# UI about instance ${clientId} status: ${status}`);
+    } else {
+        console.warn(`[MGR_QR_WS] C# UI client not connected, cannot send instance status update for ${clientId}.`);
+    }
+}
+
+function sendToClient(ws, data) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(data));
+    } else {
+        console.warn('[MGR_QR_WS] Cannot send message to client, WebSocket is not open.');
+    }
+}
+
+
 function resetManagerLinkingDisplay() {
     managerQrState.linkingClientId = null;
     updateManagerQrState('disconnected', 'Waiting for new linking attempt...');
@@ -183,4 +231,6 @@ module.exports = {
     updateManagerQrState,
     resetManagerLinkingDisplay,
     managerQrState,
+    notifyInstanceStatusChange,
+    sendToClient,
 };

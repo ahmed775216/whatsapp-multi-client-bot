@@ -8,19 +8,17 @@ const CLIENT_DATA_BASE_DIR = path.join(ROOT_DIR, 'client_data'); // Base directo
 module.exports = {
     QR_WEBSOCKET_PORT: parseInt(process.env.QR_WEBSOCKET_PORT || '8088'),
     API_BASE_URL: process.env.API_BASE_URL || 'http://smartbook.selfip.com:8080/api',
-    API_USERNAME: process.env.API_USERNAME,
-    API_PASSWORD: process.env.API_PASSWORD,
-    OWNER_NUMBER: process.env.OWNER_NUMBER,
-    SKIP_API_SYNC_ON_RECONNECT: process.env.SKIP_API_SYNC_ON_RECONNECT === 'true', // Useful for dev/debug
+    // Removed API_USERNAME, API_PASSWORD, OWNER_NUMBER from here
+    // These will be passed dynamically from C#
 
-    CLIENT_DATA_BASE_DIR, // Base directory for all client data
-    CLIENT_CODE_DIR: path.join(ROOT_DIR, 'client-instance'), // Path to the individual bot's app.js
+    SKIP_API_SYNC_ON_RECONNECT: process.env.SKIP_API_SYNC_ON_RECONNECT === 'true',
 
-    // Add default country code if not always provided by API/user
-    DEFAULT_PHONE_COUNTRY_CODE: '967', // Example for Yemen
+    CLIENT_DATA_BASE_DIR,
+    CLIENT_CODE_DIR: path.join(ROOT_DIR, 'client-instance'),
 
-    // Timeouts and intervals (adjust as needed)
-    API_SYNC_INTERVAL_MS: 3600000, // 1 hour for regular sync
+    DEFAULT_PHONE_COUNTRY_CODE: '967',
+
+    API_SYNC_INTERVAL_MS: 3600000,
     RECONNECT_DELAY_MS: 5000,
-    MESSAGE_PROCESS_TIMEOUT_MS: 30000, // Max time to process a message
+    MESSAGE_PROCESS_TIMEOUT_MS: 30000,
 };
