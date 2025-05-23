@@ -36,8 +36,11 @@ function startWebSocketServer(port, callbacks = {}) {
 
     if (wss) { console.warn("[MGR_QR_WS] WebSocket server already running."); return; }
 
-    wss = new WebSocket.Server({ port });
-    console.log(`[MGR_QR_WS] WebSocket server for QR started on port ${port}`);
+    // --- CRITICAL FIX: Explicitly bind to '0.0.0.0' for external access ---
+    wss = new WebSocket.Server({ port: port, host: '0.0.0.0' }); // Added host option
+    // --- END CRITICAL FIX ---
+
+    console.log(`[MGR_QR_WS] WebSocket server for QR started on port ${port} and binding to 0.0.0.0`); // Updated log
 
     wss.on('connection', (ws, req) => {
         const clientIP = req.socket.remoteAddress;
@@ -111,14 +114,14 @@ function startWebSocketServer(port, callbacks = {}) {
 }
 
 function handleCSharpUiCommand(ws, parsedMsg) {
-    const { type, clientId, apiUsername, apiPassword, ownerNumber, ...otherData } = parsedMsg; // NEW: Extract ownerNumber
+    const { type, clientId, apiUsername, apiPassword, ownerNumber, ...otherData } = parsedMsg;
 
     switch (type) {
         case 'requestQr':
-            if (onQrRequestedCallback) onQrRequestedCallback(apiUsername, apiPassword, ownerNumber); // NEW: Pass ownerNumber
+            if (onQrRequestedCallback) onQrRequestedCallback(apiUsername, apiPassword, ownerNumber);
             break;
         case 'manualRelink':
-            if (onManualRelinkCallback) onManualRelinkCallback(apiUsername, apiPassword, ownerNumber); // NEW: Pass ownerNumber
+            if (onManualRelinkCallback) onManualRelinkCallback(apiUsername, apiPassword, ownerNumber);
             break;
         case 'listInstances':
             if (onListInstancesCallback) onListInstancesCallback(ws);
