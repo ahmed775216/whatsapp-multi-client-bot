@@ -9,33 +9,29 @@ const instanceManager = require('./instanceManager');
 
 console.log('--- Starting WhatsApp Bot Manager ---');
 
-// Fix 4: Update the manager's QR request handler to use consistent ID generation
-function handleQrRequest() {
-    // Generate the client ID for the new linking attempt.
-    // This will create an ID like 'client_new_linking_TIMESTAMP'
+// Modified handleQrRequest to accept API credentials
+function handleQrRequest(apiUsername, apiPassword) {
     const linkingClientId = instanceManager.generateClientId('new_linking_num');
     
-    console.log(`[MANAGER] C# app requested QR. Launching temporary client: ${linkingClientId}`);
+    console.log(`[MANAGER] C# app requested QR. Launching temporary client: ${linkingClientId} with API user: ${apiUsername ? 'Provided' : 'None'}`);
     
-    // Update qrWebSocketServer's state to track this new linking client ID for the UI
-    // Pass `isLinkingProcess = true`
     qrWebSocketServer.updateManagerQrState(
         'linking_in_progress', 
         'Generating QR code for new WhatsApp link...', 
-        null, // No QR yet
-        linkingClientId, // The ID of the client bot that will provide the QR
-        null, null, // No phone/name yet
-        true  // This is for an active linking process on the UI
+        null, 
+        linkingClientId, 
+        null, null, 
+        true
     );
     
-    // Launch the instance. It will connect back and send its QR.
-    // Pass default API credentials for now; Stage 4 will handle client-specific ones.
-    instanceManager.launchClientInstance(linkingClientId, 'new_linking_num', true, config.API_USERNAME, config.API_PASSWORD);
+    // Pass the API credentials received from C# directly to launchClientInstance
+    instanceManager.launchClientInstance(linkingClientId, 'new_linking_num', true, apiUsername, apiPassword);
 }
 
 const wsCallbacks = {
-    onQrRequested: handleQrRequest, // Use the updated handler
-    onManualRelink: () => {
+    // onQrRequested and onManualRelink will now receive API credentials from C#
+    onQrRequested: (apiUsername, apiPassword) => handleQrRequest(apiUsername, apiPassword),
+    onManualRelink: (apiUsername, apiPassword) => { // Manual relink also sends credentials
         console.log('[MANAGER] C# app requested manual re-link (logout/new QR).');
         const currentUiLinkingClientId = qrWebSocketServer.managerQrState?.linkingClientId;
         if (currentUiLinkingClientId) {
@@ -44,7 +40,7 @@ const wsCallbacks = {
         }
         qrWebSocketServer.resetManagerLinkingDisplay();
         setTimeout(() => { // Give a moment for cleanup
-            handleQrRequest(); // Trigger a new linking process
+            handleQrRequest(apiUsername, apiPassword); // Trigger a new linking process with credentials
         }, 1000);
     },
     onIncomingClientStatus: (clientId, data) => {
@@ -52,7 +48,8 @@ const wsCallbacks = {
     },
     onIncomingClientQr: (clientId, qrData) => {
         instanceManager.handleClientBotQrUpdate(clientId, qrData);
-    }
+    },
+    // Removed onActivateClientWithApi callback as it's no longer part of this flow
 };
 
 qrWebSocketServer.startWebSocketServer(config.QR_WEBSOCKET_PORT, wsCallbacks);
@@ -60,7 +57,6 @@ instanceManager.recoverExistingClientInstances();
 
 process.on('uncaughtException', (err) => {
     console.error('[MANAGER_FATAL] Uncaught Exception:', err);
-    // Use a generic client ID or null if it's a manager-level error not tied to a specific linking op
     qrWebSocketServer.updateManagerQrState('error', `Manager internal error: ${err.message}`, null, null, null, null, false);
     process.exit(1);
 });

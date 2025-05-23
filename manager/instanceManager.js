@@ -4,7 +4,7 @@ const path = require('path');
 const fs = require('fs');
 
 const config = require('../config');
-const { updateManagerQrState } = require('./qrWebSocketServer'); // Correctly imported
+const { updateManagerQrState } = require('./qrWebSocketServer');
 
 const ACTIVE_BOT_INSTANCES = {};
 
@@ -15,15 +15,11 @@ function ensureClientDataDirExists() {
     }
 }
 
-// Fix 1: Update generateClientId function to handle linking clients properly
 function generateClientId(phoneNumber) {
-    // Handle the special case for new linking attempts
     if (phoneNumber === 'new_linking_num' || !phoneNumber || phoneNumber.trim() === '') {
         return `client_new_linking_${Date.now()}`;
     }
-    
-    // For regular phone numbers, clean and format
-    const cleanPhone = phoneNumber.replace(/\D/g, ''); // Remove non-digits
+    const cleanPhone = phoneNumber.replace(/\D/g, '');
     return `client_${cleanPhone}_${Date.now()}`;
 }
 
@@ -31,8 +27,15 @@ function getClientDataPath(clientId) {
     return path.join(config.CLIENT_DATA_BASE_DIR, clientId);
 }
 
-// Fix 3: Ensure the linking client ID is properly set when launching (via isLinkingClient flag)
-function launchClientInstance(clientId, phoneNumber, forceNewScan = false, apiUsername = config.API_USERNAME, apiPassword = config.API_PASSWORD) {
+/**
+ * Launches a new bot instance as a child process.
+ * @param {string} clientId - Unique ID for this client instance.
+ * @param {string} phoneNumber - The phone number associated with this client (for identifying instance).
+ * @param {boolean} forceNewScan - True if we need to clear session data for a new QR scan.
+ * @param {string} [apiUsername=null] - API username for this specific client bot.
+ * @param {string} [apiPassword=null] - API password for this specific client bot.
+ */
+function launchClientInstance(clientId, phoneNumber, forceNewScan = false, apiUsername = null, apiPassword = null) {
     ensureClientDataDirExists();
 
     const clientDataPath = getClientDataPath(clientId);
@@ -58,15 +61,15 @@ function launchClientInstance(clientId, phoneNumber, forceNewScan = false, apiUs
         CLIENT_ID: clientId,
         OWNER_NUMBER_FOR_CLIENT: config.OWNER_NUMBER,
         MANAGER_WS_PORT: config.QR_WEBSOCKET_PORT,
-        API_USERNAME_FOR_CLIENT_BOT_LOGIC: apiUsername,
-        API_PASSWORD_FOR_CLIENT_BOT_LOGIC: apiPassword,
-        FORCE_NEW_SCAN: forceNewScan ? 'true' : 'false',
-        API_BASE_URL: config.API_BASE_URL, // Ensure client gets the correct API base
+        API_USERNAME_FOR_CLIENT_BOT_LOGIC: apiUsername, // Pass provided username
+        API_PASSWORD_FOR_CLIENT_BOT_LOGIC: apiPassword, // Pass provided password
+        API_BASE_URL: config.API_BASE_URL,
+        // Removed SKIP_API_SYNC as it's no longer necessary with this flow
     };
 
     const clientBotEntryFile = path.join(config.CLIENT_CODE_DIR, 'clientBotApp.js');
 
-    console.log(`[INST_MGR] Launching instance for ${clientId} (phone: ${phoneNumber}). Force new scan: ${forceNewScan}`);
+    console.log(`[INST_MGR] Launching instance for ${clientId} (phone: ${phoneNumber}). Force new scan: ${forceNewScan}. API User: ${apiUsername ? 'Provided' : 'None'}`);
 
     const child = spawn('node', [clientBotEntryFile], {
         cwd: config.CLIENT_CODE_DIR,
@@ -82,11 +85,13 @@ function launchClientInstance(clientId, phoneNumber, forceNewScan = false, apiUs
         status: 'starting',
         lastUpdated: Date.now(),
         lastKnownQR: null,
-        isLinkingClient: phoneNumber === 'new_linking_num' || clientId.startsWith('client_new_linking_') // Add this flag
+        isLinkingClient: phoneNumber === 'new_linking_num' || clientId.startsWith('client_new_linking_'),
+        apiUsername: apiUsername, // Store these for potential re-launch (e.g., if manager restarts)
+        apiPassword: apiPassword,
     };
 
     child.stdout.on('data', (data) => {
-        // const logLine = data.toString().trim();
+        const logLine = data.toString().trim();
         // console.log(`[${clientId}_OUT] ${logLine}`);
     });
 
@@ -103,7 +108,6 @@ function launchClientInstance(clientId, phoneNumber, forceNewScan = false, apiUs
         }
         delete ACTIVE_BOT_INSTANCES[clientId];
         
-        // If the process that was actively linking (according to managerQrState) just exited.
         const currentUiLinkingClientId = require('./qrWebSocketServer').managerQrState?.linkingClientId;
         if (clientId === currentUiLinkingClientId && code !== 0) {
              updateManagerQrState('linking_failed', `QR linking process failed unexpectedly for ${clientId}.`, null, clientId, null, null, true);
@@ -133,20 +137,18 @@ function stopClientInstance(clientId) {
         instance.status = 'stopping';
         instance.lastUpdated = Date.now();
         
-        if (instance.process.connected) { // For IPC, not directly used here but good practice
+        if (instance.process.connected) {
             instance.process.disconnect();
         }
-        instance.process.kill('SIGTERM'); // Graceful termination
+        instance.process.kill('SIGTERM');
 
-        // Set a timeout to force kill if it doesn't exit gracefully
         instance.terminateTimeout = setTimeout(() => {
             if (instance.process && instance.process.pid && !instance.process.killed) {
                 console.warn(`[INST_MGR] Client ${instance.clientId} not exiting gracefully, force killing.`);
                 instance.process.kill('SIGKILL');
             }
-        }, 10000); // 10 seconds grace period
+        }, 10000);
 
-        // 'close' event on child process will delete from ACTIVE_BOT_INSTANCES
         return true;
     }
     return false;
@@ -161,29 +163,33 @@ function recoverExistingClientInstances() {
         if (folderName.startsWith('client_new_linking_')) continue;
 
         const clientAuthPath = path.join(config.CLIENT_DATA_BASE_DIR, folderName, 'auth_info_baileys');
+        // A placeholder for loading stored API credentials for recovered clients
+        // This would ideally be saved in a config file alongside auth_info_baileys
+        // For now, these recovered clients won't have specific API credentials unless implemented later.
+        const recoveredApiUsername = null; 
+        const recoveredApiPassword = null; 
         
         if (fs.existsSync(clientAuthPath) && fs.readdirSync(clientAuthPath).length > 0) {
             const phoneNumberMatch = folderName.match(/client_(\d+)_/);
             const phoneNumber = phoneNumberMatch ? phoneNumberMatch[1] : folderName;
 
             console.log(`[INST_MGR] Found existing session for client folder: ${folderName} (Phone: ${phoneNumber}). Attempting to launch.`);
-            launchClientInstance(folderName, phoneNumber, false /* no forceNewScan */);
+            // Launch recovered client with any loaded API credentials
+            launchClientInstance(folderName, phoneNumber, false, recoveredApiUsername, recoveredApiPassword);
         } else {
             console.log(`[INST_MGR] Folder ${folderName} does not contain an active session. Skipping restart.`);
         }
     }
 }
 
-// Fix 2: Update the QR handling logic to be more robust
 function handleClientBotQrUpdate(clientId, qr) {
     const instance = ACTIVE_BOT_INSTANCES[clientId];
     if (instance) {
         instance.lastKnownQR = qr;
         
-        // Check if this is a linking client (either by prefix OR by matching current linking client ID in qrWebSocketServer)
         const isCurrentlyLinkingOnUI = clientId === require('./qrWebSocketServer').managerQrState?.linkingClientId;
         
-        if (instance.isLinkingClient || isCurrentlyLinkingOnUI) { // Check our flag or if UI is tracking it
+        if (instance.isLinkingClient || isCurrentlyLinkingOnUI) {
             console.log(`[INST_MGR] QR received from linking client ${clientId}. Broadcasting to UI.`);
             updateManagerQrState('qr', 'Scan the QR code with WhatsApp.', qr, clientId, null, null, true);
         } else {
@@ -211,9 +217,9 @@ function handleClientBotStatusUpdate(clientId, data) {
     const currentUiLinkingClientId = require('./qrWebSocketServer').managerQrState?.linkingClientId;
 
     if (status === 'connected') {
-        if (instance && (instance.isLinkingClient || clientId === currentUiLinkingClientId)) { // Successfully linked the client UI was waiting for
-            const oldLinkingClientId = clientId; // This is the temporary ID (e.g., client_new_linking_...)
-            const newPermanentClientId = generateClientId(phoneNumber); // Create permanent ID based on actual phone
+        if (instance && (instance.isLinkingClient || clientId === currentUiLinkingClientId)) {
+            const oldLinkingClientId = clientId;
+            const newPermanentClientId = generateClientId(phoneNumber);
 
             const oldClientPath = getClientDataPath(oldLinkingClientId);
             const newClientPath = getClientDataPath(newPermanentClientId);
@@ -221,7 +227,7 @@ function handleClientBotStatusUpdate(clientId, data) {
 
             if (fs.existsSync(oldClientPath)) {
                 try {
-                    if (oldClientPath !== newClientPath) { // Only rename if IDs are different
+                    if (oldClientPath !== newClientPath) {
                         fs.renameSync(oldClientPath, newClientPath);
                         console.log(`[INST_MGR] Client data folder renamed from ${oldLinkingClientId} to ${newPermanentClientId}.`);
                     } else {
@@ -234,57 +240,72 @@ function handleClientBotStatusUpdate(clientId, data) {
                 }
             } else {
                 console.warn(`[INST_MGR] Old client path ${oldClientPath} not found for rename during linking. Active session might be in new path already.`);
-                if (phoneNumber) renameSuccess = true; // Assume it's okay if we have phone number
+                if (phoneNumber) renameSuccess = true;
             }
 
             if (renameSuccess) {
+                // If it was a temporary client, stop the old process and launch the new permanent one.
+                // The new permanent one will use the API credentials stored in 'instance' which came from C#.
                 if (oldLinkingClientId !== newPermanentClientId) {
-                    // Stop the old temporary process
-                    stopClientInstance(oldLinkingClientId); 
-                    // Delete from active instances if stopClientInstance doesn't do it immediately
+                    stopClientInstance(oldLinkingClientId);
                     if (ACTIVE_BOT_INSTANCES[oldLinkingClientId]) delete ACTIVE_BOT_INSTANCES[oldLinkingClientId];
                 }
-                
+
                 console.log(`[INST_MGR] Client ${newPermanentClientId} (${phoneNumber}) successfully linked. (Re)Launching as permanent.`);
-                // Ensure the process is running under the new permanent ID if it was renamed
-                // If the same process continues, its env.CLIENT_ID is still the old one.
-                // It's safer to stop the temp and launch a new permanent one.
-                // (The stopClientInstance for oldLinkingClientId handles this if different)
-                if (!ACTIVE_BOT_INSTANCES[newPermanentClientId]) { // If it's truly a new permanent entry
-                     launchClientInstance(newPermanentClientId, phoneNumber, false, instance?.apiUsername, instance?.apiPassword);
-                } else { // If the same process is to continue, update its details (less ideal)
+                const linkedApiUsername = instance.apiUsername; // Get API credentials that came with the linking request
+                const linkedApiPassword = instance.apiPassword;
+
+                // Launch the new permanent instance with the collected API credentials
+                if (!ACTIVE_BOT_INSTANCES[newPermanentClientId]) {
+                    launchClientInstance(newPermanentClientId, phoneNumber, false, linkedApiUsername, linkedApiPassword);
+                } else {
+                    // If the process somehow continues (unlikely after rename), update its state
                     ACTIVE_BOT_INSTANCES[newPermanentClientId].isLinkingClient = false;
+                    ACTIVE_BOT_INSTANCES[newPermanentClientId].apiUsername = linkedApiUsername;
+                    ACTIVE_BOT_INSTANCES[newPermanentClientId].apiPassword = linkedApiPassword;
+                    // If it's a running process, force a restart to ensure env vars are picked up
+                    if (ACTIVE_BOT_INSTANCES[newPermanentClientId].process && ACTIVE_BOT_INSTANCES[newPermanentClientId].process.connected) {
+                         console.warn(`[INST_MGR] Client ${newPermanentClientId} already active. Forcing restart to update API credentials.`);
+                         stopClientInstance(newPermanentClientId);
+                         launchClientInstance(newPermanentClientId, phoneNumber, false, linkedApiUsername, linkedApiPassword);
+                    }
                 }
 
-                updateManagerQrState('connected', `WhatsApp Linked: ${name} (${phoneNumber})!`, null, newPermanentClientId, phoneNumber, name, false); // isLinkingProcess is now false
+                updateManagerQrState('connected', `WhatsApp Linked: ${name} (${phoneNumber})!`, null, newPermanentClientId, phoneNumber, name, false);
             }
         } else {
             console.log(`[INST_MGR] Existing client ${clientId} (${phoneNumber || instance?.phoneNumber || 'unknown'}) reported status: ${status}. Message: ${message}`);
         }
-    } else if (clientId === currentUiLinkingClientId) { // Update UI only if it's the client being actively linked
+    } else if (clientId === currentUiLinkingClientId) {
         if (status === 'disconnected_logout' || status === 'error' || status === 'linking_failed') {
-            updateManagerQrState(status, message, null, clientId, null, null, true); // Still a linking process
-            if (status !== 'error') { // Linking process ends
+            updateManagerQrState(status, message, null, clientId, null, null, true);
+            if (status !== 'error') {
                 require('./qrWebSocketServer').resetManagerLinkingDisplay();
             }
             if (status === 'disconnected_logout' || status === 'linking_failed') {
                 stopClientInstance(clientId);
             }
         } else if (status === 'qr') {
-            if (qrFromStatusData) { // QR might be part of a status update
-                 handleClientBotQrUpdate(clientId, qrFromStatusData);
+            if (qrFromStatusData) {
+                handleClientBotQrUpdate(clientId, qrFromStatusData);
             }
         } else if (status === 'connecting') {
             updateManagerQrState('linking_in_progress', `WhatsApp connecting... (Client ID: ${clientId})`, null, clientId, null, null, true);
         }
     } else if (status === 'disconnected_logout' || status === 'error' || status === 'linking_failed') {
-        // A non-UI-focused client had an issue
         console.log(`[INST_MGR] Non-linking client ${clientId} reported ${status}: ${message}.`);
         if (status === 'disconnected_logout' || status === 'linking_failed') {
             stopClientInstance(clientId);
         }
     }
 }
+
+// The restartClientWithApi function is no longer needed in this exact form
+// because API credentials are provided upfront. We can simplify this.
+// If you still need a way to update credentials for an *already running* client later,
+// this pattern is correct, but the trigger will be different.
+// For now, let's remove it as it's not part of the initial "before QR" flow.
+// (Or keep it if you foresee a separate "update API credentials" button later)
 
 module.exports = {
     launchClientInstance,
@@ -293,4 +314,5 @@ module.exports = {
     generateClientId,
     handleClientBotQrUpdate,
     handleClientBotStatusUpdate,
+    // restartClientWithApi, // Removed or adapted
 };
