@@ -2,6 +2,7 @@
 const fetch = require('node-fetch');
 
 const { formatJid, addToWhitelist, removeFromWhitelist, saveUserGroupPermissionsFile } = require('../plugins/whitelist');
+const config = require('../../config'); // Import shared config to get DEFAULT_PHONE_COUNTRY_CODE
 
 const API_BASE_URL = process.env.API_BASE_URL;
 const API_LOGIN_ENDPOINT = `${API_BASE_URL}/login`;
@@ -11,7 +12,6 @@ console.log(`[${process.env.CLIENT_ID}_API_SYNC_CONFIG] API_BASE_URL: ${API_BASE
 console.log(`[${process.env.CLIENT_ID}_API_SYNC_CONFIG] API_LOGIN_ENDPOINT: ${API_LOGIN_ENDPOINT}`);
 console.log(`[${process.env.CLIENT_ID}_API_SYNC_CONFIG] API_GET_CONTACTS_ENDPOINT: ${API_GET_CONTACTS_ENDPOINT}`);
 
-// Use API credentials specifically for this client instance
 const CLIENT_API_USERNAME = process.env.API_USERNAME_FOR_CLIENT_BOT_LOGIC;
 const CLIENT_API_PASSWORD = process.env.API_PASSWORD_FOR_CLIENT_BOT_LOGIC;
 
@@ -25,12 +25,42 @@ if (!global.userGroupPermissions) {
 }
 
 /**
+ * Ensures a phone number is in full JID format with country code.
+ * @param {string} mobileNumber - The phone number from the API (e.g., "771234567").
+ * @returns {string} - Full JID (e.g., "967771234567@s.whatsapp.net").
+ */
+function normalizePhoneNumberToJid(mobileNumber) {
+    let cleanedNumber = mobileNumber.replace(/\D/g, ''); // Remove non-digits
+    
+    // Check if the number already starts with the country code (or '00' then country code)
+    if (!cleanedNumber.startsWith(config.DEFAULT_PHONE_COUNTRY_CODE) && !cleanedNumber.startsWith('00' + config.DEFAULT_PHONE_COUNTRY_CODE)) {
+        cleanedNumber = config.DEFAULT_PHONE_COUNTRY_CODE + cleanedNumber;
+    }
+    
+    return formatJid(cleanedNumber); // formatJid already adds @s.whatsapp.net
+}
+
+/**
+ * Strips the country code from a JID's number part, if present,
+ * for sending to an API that expects local numbers.
+ * @param {string} fullJid - The full JID (e.g., "967771234567@s.whatsapp.net").
+ * @param {string} countryCode - The country code to strip (e.g., '967').
+ * @returns {string} - The local number (e.g., "771234567").
+ */
+function stripCountryCode(fullJid, countryCode) {
+    const numberPart = fullJid.split('@')[0];
+    if (numberPart.startsWith(countryCode)) {
+        return numberPart.substring(countryCode.length);
+    }
+    return numberPart;
+}
+
+/**
  * Attempts to log in to the external API and store the token.
  * Uses client-specific API credentials.
  */
 async function loginToApi() {
     console.log(`[${process.env.CLIENT_ID}_API_SYNC] Attempting login to external API...`);
-    // Ensure credentials are provided for this client instance
     if (!CLIENT_API_USERNAME || !CLIENT_API_PASSWORD) {
         console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] API username or password not set for this client instance. Skipping API login.`);
         return null;
@@ -41,8 +71,8 @@ async function loginToApi() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                username: CLIENT_API_USERNAME, // Use client-specific API credentials
-                password: CLIENT_API_PASSWORD, // Use client-specific API credentials
+                username: CLIENT_API_USERNAME,
+                password: CLIENT_API_PASSWORD,
             }),
         });
 
@@ -73,7 +103,6 @@ async function loginToApi() {
 async function syncWhitelistFromApi() {
     console.log(`[${process.env.CLIENT_ID}_API_SYNC] Starting whitelist sync...`);
     
-    // Check if API credentials exist before attempting login
     if (!CLIENT_API_USERNAME || !CLIENT_API_PASSWORD) {
         console.log(`[${process.env.CLIENT_ID}_API_SYNC] Client API credentials not set. Skipping sync.`);
         return;
@@ -115,7 +144,7 @@ async function syncWhitelistFromApi() {
 
         for (const contact of contactsArray) {
             if (contact.mobile) {
-                const jid = formatJid(contact.mobile);
+                const jid = normalizePhoneNumberToJid(contact.mobile); // Use the new normalization function here
                 apiUserJidsProcessed.add(jid);
 
                 if (contact.active === true) {
@@ -159,4 +188,4 @@ async function syncWhitelistFromApi() {
     }
 }
 
-module.exports = { syncWhitelistFromApi };
+module.exports = { syncWhitelistFromApi, getApiToken: () => apiToken, stripCountryCode }; // Export getApiToken and stripCountryCode

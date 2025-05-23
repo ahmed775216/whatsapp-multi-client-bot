@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhatsApp Bot Manager</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>WhatsApp Bot Manager</h1>
+
+        <section class="controls">
+            <h2>Global Settings</h2>
+            <div class="input-group">
+                <label for="ownerNumber">Owner Phone Number:</label>
+                <input type="text" id="ownerNumber" placeholder="e.g., 967771234567">
+                <button id="setOwnerBtn">Set Owner</button>
+            </div>
+            <p id="ownerStatus" class="status-message"></p>
+        </section>
+
+        <section class="client-linking">
+            <h2>Link New WhatsApp Client</h2>
+            <div class="input-group">
+                <label for="newClientApiUsername">API Username:</label>
+                <input type="text" id="newClientApiUsername" value="781028068" placeholder="Enter API Username">
+            </div>
+            <div class="input-group">
+                <label for="newClientApiPassword">API Password:</label>
+                <input type="password" id="newClientApiPassword" value="781028068" placeholder="Enter API Password">
+            </div>
+            <button id="linkNewClientBtn">Link New Client</button>
+            <p id="linkingStatus" class="status-message"></p>
+            <div class="qr-code-display">
+                <img id="qrCodeImg" src="" alt="Scan QR Code" style="display:none;">
+            </div>
+            <p id="qrMessage" class="status-message"></p>
+        </section>
+
+        <section class="active-clients">
+            <h2>Active Clients</h2>
+            <button id="refreshClientsBtn">Refresh List</button>
+            <ul id="clientList">
+                <li>Loading clients...</li>
+            </ul>
+        </section>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>

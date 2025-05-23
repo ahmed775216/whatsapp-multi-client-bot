@@ -16,7 +16,8 @@ module.exports = {
             console.log(`[${process.env.CLIENT_ID}_FILTER] Sender ${sender.split('@')[0]} not generally whitelisted. Blocking.`);
             if (!isGroup) {
                 try {
-                    await sock.sendMessage(sender, { text: `Sorry, you are not authorized to use this bot.` });
+                    //react to sender
+                    await sock.sendMessage(sender, { react: { text: '🚫', key: m.key } });
                 } catch (e) { console.error(`[${process.env.CLIENT_ID}_FILTER_ERROR] Failed to send DM to non-whitelisted user: ${sender}`, e); }
             }
             return {};

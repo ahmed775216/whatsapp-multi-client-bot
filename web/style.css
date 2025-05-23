@@ -1,0 +1,132 @@
+body {
+    font-family: Arial, sans-serif;
+    margin: 0;
+    padding: 20px;
+    background-color: #f4f4f4;
+    color: #333;
+}
+
+.container {
+    max-width: 900px;
+    margin: 0 auto;
+    background-color: #fff;
+    padding: 30px;
+    border-radius: 8px;
+    box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+}
+
+h1, h2 {
+    color: #0056b3;
+    border-bottom: 1px solid #eee;
+    padding-bottom: 10px;
+    margin-bottom: 20px;
+}
+
+section {
+    margin-bottom: 30px;
+    padding-bottom: 20px;
+    border-bottom: 1px dashed #eee;
+}
+
+section:last-of-type {
+    border-bottom: none;
+}
+
+.input-group {
+    margin-bottom: 15px;
+}
+
+.input-group label {
+    display: block;
+    margin-bottom: 5px;
+    font-weight: bold;
+}
+
+.input-group input[type="text"],
+.input-group input[type="password"] {
+    width: calc(100% - 120px);
+    padding: 8px;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    display: inline-block;
+    margin-right: 10px;
+}
+
+button {
+    padding: 10px 15px;
+    background-color: #007bff;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 16px;
+}
+
+button:hover {
+    background-color: #0056b3;
+}
+
+.status-message {
+    margin-top: 10px;
+    padding: 8px;
+    border-radius: 4px;
+    background-color: #e9ecef;
+    color: #495057;
+}
+
+.qr-code-display {
+    text-align: center;
+    margin-top: 20px;
+}
+
+.qr-code-display img {
+    max-width: 250px;
+    height: auto;
+    border: 1px solid #ddd;
+    padding: 5px;
+    background-color: white;
+}
+
+#clientList {
+    list-style: none;
+    padding: 0;
+}
+
+#clientList li {
+    background-color: #f8f9fa;
+    border: 1px solid #e2e6ea;
+    padding: 10px 15px;
+    margin-bottom: 8px;
+    border-radius: 4px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+#clientList li .status {
+    font-weight: bold;
+    margin-left: 10px;
+}
+
+#clientList li .status.connected {
+    color: green;
+}
+
+#clientList li .status.disconnected {
+    color: red;
+}
+
+#clientList li .status.connecting,
+#clientList li .status.reconnecting,
+#clientList li .status.linking_in_progress {
+    color: orange;
+}
+
+#clientList li .actions button {
+    margin-left: 5px;
+    background-color: #28a745; /* Green for Start/Restart */
+}
+
+#clientList li .actions button.stop-btn {
+    background-color: #dc3545; /* Red for Stop */
+}
