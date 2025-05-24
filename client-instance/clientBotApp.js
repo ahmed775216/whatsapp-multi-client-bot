@@ -10,9 +10,6 @@ const WebSocket = require('ws');
 const AUTH_DIR = process.env.AUTH_DIR; // e.g., client_data/client_12345/auth_info_baileys
 const DATA_DIR = process.env.DATA_DIR; // e.g., client_data/client_12345/data
 const CLIENT_ID = process.env.CLIENT_ID;
-// BOT_OWNER_NUMBER, API_USERNAME_FOR_CLIENT, API_PASSWORD_FOR_CLIENT are passed from manager as env vars,
-// but we will try to load them from client_config.json first if available.
-// Keep these consts as they are what the manager _might_ have explicitly passed.
 const MANAGER_WS_PORT = parseInt(process.env.MANAGER_WS_PORT || '0');
 
 if (!AUTH_DIR || !DATA_DIR || !CLIENT_ID || MANAGER_WS_PORT === 0) {
@@ -23,9 +20,9 @@ if (!AUTH_DIR || !DATA_DIR || !CLIENT_ID || MANAGER_WS_PORT === 0) {
 if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-// --- NEW: Load client_config.json for persistent credentials ---
+// --- Load client_config.json for persistent credentials ---
 let clientConfig = {};
-const clientConfigPath = path.join(path.dirname(AUTH_DIR), 'client_config.json'); // client_data/client_ID/client_config.json
+const clientConfigPath = path.join(path.dirname(AUTH_DIR), 'client_config.json');
 
 if (fs.existsSync(clientConfigPath)) {
     try {
@@ -33,7 +30,6 @@ if (fs.existsSync(clientConfigPath)) {
         console.log(`[${CLIENT_ID}] Loaded client_config.json from ${clientConfigPath}.`);
     } catch (e) {
         console.error(`[${CLIENT_ID}] Error loading client_config.json:`, e.message);
-        // Fallback to environment variables if config file is corrupted
         clientConfig = {};
     }
 } else {
@@ -42,14 +38,12 @@ if (fs.existsSync(clientConfigPath)) {
 
 // --- Set up process.env for modules within this client instance ---
 // Prioritize values from client_config.json if available, otherwise use what manager passed via env.
-// This is critical for whitelist.js and apiSync.js to use the correct paths and credentials.
 process.env.DATA_DIR_FOR_CLIENT = DATA_DIR;
 process.env.AUTH_DIR_FOR_CLIENT = AUTH_DIR;
 process.env.OWNER_NUMBER_FOR_CLIENT_BOT_LOGIC = clientConfig.ownerNumber || process.env.OWNER_NUMBER_FOR_CLIENT_BOT_LOGIC;
 process.env.API_USERNAME_FOR_CLIENT_BOT_LOGIC = clientConfig.apiUsername || process.env.API_USERNAME_FOR_CLIENT_BOT_LOGIC;
 process.env.API_PASSWORD_FOR_CLIENT_BOT_LOGIC = clientConfig.apiPassword || process.env.API_PASSWORD_FOR_CLIENT_BOT_LOGIC;
 
-// Now, re-declare these consts to reflect the values set in process.env
 const BOT_OWNER_NUMBER = process.env.OWNER_NUMBER_FOR_CLIENT_BOT_LOGIC;
 const API_USERNAME_FOR_CLIENT = process.env.API_USERNAME_FOR_CLIENT_BOT_LOGIC;
 const API_PASSWORD_FOR_CLIENT = process.env.API_PASSWORD_FOR_CLIENT_BOT_LOGIC;
@@ -64,6 +58,9 @@ console.log(`[${CLIENT_ID}_ENV_CHECK]   API_USERNAME_FOR_CLIENT_BOT_LOGIC: ${API
 console.log(`[${CLIENT_ID}_ENV_CHECK]   API_PASSWORD_FOR_CLIENT_BOT_LOGIC: ${API_PASSWORD_FOR_CLIENT ? '*** (Set)' : 'NULL'}`);
 console.log(`[${CLIENT_ID}_ENV_CHECK]   API_BASE_URL: ${process.env.API_BASE_URL}`);
 // --- DEBUG LOG END ---
+
+// Declare sock in a higher scope so it's accessible from managerWsClient.onmessage
+let sock;
 
 // --- Manager WebSocket Client ---
 let managerWsClient = null;
@@ -84,8 +81,62 @@ function connectToManagerWebSocket() {
             message: `Client ${CLIENT_ID} bot instance started, attempting WhatsApp connection.`,
         });
     };
-    managerWsClient.onmessage = (event) => {
-        console.log(`[${CLIENT_ID}] Received command from manager: ${event.data}`);
+    // Manager message handling
+    managerWsClient.onmessage = async (event) => { // Now async to handle internal commands
+        try {
+            const parsedMsg = JSON.parse(event.data);
+            if (parsedMsg.type === 'internalCommand') {
+                console.log(`[${CLIENT_ID}] Received internal command from manager: ${parsedMsg.command}`);
+
+                // Check if sock is defined before trying to use it
+                if (!sock) {
+                    console.warn(`[${CLIENT_ID}] Internal command '${parsedMsg.command}' received before WhatsApp socket (sock) was initialized. Skipping.`);
+                    const internalReply = (data) => {
+                        if (managerWsClient && managerWsClient.readyState === WebSocket.OPEN) {
+                            managerWsClient.send(JSON.stringify({ type: 'internalReply', clientId: CLIENT_ID, data: data }));
+                        }
+                    };
+                    internalReply({ type: 'error', message: `Bot is not fully initialized yet. Please try again in a moment.`, clientId: CLIENT_ID });
+                    return;
+                }
+
+                const internalReply = (data) => {
+                    if (managerWsClient && managerWsClient.readyState === WebSocket.OPEN) {
+                        managerWsClient.send(JSON.stringify({ type: 'internalReply', clientId: CLIENT_ID, data: data }));
+                    } else {
+                        console.warn(`[${CLIENT_ID}] Manager WS not open, cannot send internal reply.`);
+                    }
+                };
+
+                // For internal commands, create a dummy 'm' object as handleMessage expects it
+                const dummyM = {
+                    key: { remoteJid: `${CLIENT_ID}@s.whatsapp.net`, fromMe: true, participant: jidNormalizedUser(sock.user?.id) },
+                    messageTimestamp: Date.now() / 1000
+                };
+
+                // Recalculate isOwner for internal commands based on actual bot's identity
+                const botCanonicalJid = sock.user && sock.user.id ? jidNormalizedUser(sock.user.id) : null;
+                const ownerNumbers = (process.env.OWNER_NUMBER_FOR_CLIENT_BOT_LOGIC || "")
+                    .split(',')
+                    .map(num => num.trim().replace(/@s\.whatsapp\.net$/, ''))
+                    .filter(num => num);
+                const isOwnerBot = ownerNumbers.some(ownerPhone => jidNormalizedUser(`${ownerPhone}@s.whatsapp.net`) === botCanonicalJid);
+
+
+                await handleMessage(sock, dummyM, {
+                    isInternalCommand: true,
+                    internalReply: internalReply,
+                    command: parsedMsg.command,
+                    groupId: parsedMsg.groupId, // Pass optional groupId for group-related commands
+                    clientId: CLIENT_ID,
+                    isOwner: isOwnerBot, // Pass actual bot owner status
+                });
+            } else {
+                console.log(`[${CLIENT_ID}] Manager message (type: ${parsedMsg.type}): ${event.data}`);
+            }
+        } catch (error) {
+            console.error(`[${CLIENT_ID}] Error processing manager message:`, error);
+        }
     };
 
     managerWsClient.onclose = () => {
@@ -125,7 +176,7 @@ async function startClientBot() {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     const { version } = await fetchLatestBaileysVersion();
 
-    const sock = makeWASocket({
+    sock = makeWASocket({ // Assign to the higher-scoped 'sock' variable
         version,
         logger: pino({ level: 'info' }),
         auth: state,
@@ -202,7 +253,10 @@ async function startClientBot() {
         if (upsert.type !== 'notify') return;
         console.log(`[${CLIENT_ID}] Received ${upsert.messages.length} new messages.`);
         for (const m of upsert.messages) {
-            await handleMessage(sock, m);
+            // isOwner must be passed to handler logic for regular messages
+            // This is determined within handler.js for messages based on the actual sender and configured OWNER_NUMBER
+            // No direct 'isOwner' option is set here for WA messages; handler figures it out.
+            await handleMessage(sock, m, {}); // Options for WA messages are empty for now
         }
     });
 }

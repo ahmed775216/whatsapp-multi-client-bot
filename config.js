@@ -11,14 +11,17 @@ module.exports = {
     // Removed API_USERNAME, API_PASSWORD, OWNER_NUMBER from here
     // These will be passed dynamically from C#
 
-    SKIP_API_SYNC_ON_RECONNECT: process.env.SKIP_API_SYNC_ON_RECONNECT === 'true',
+    // Note: SKIP_API_SYNC_ON_RECONNECT was present in original file but not in .env.
+    // Ensure if you want to use it, it's explicitly set to 'true' or 'false' in .env.
+    // For now, it's commented out if not present, otherwise use its value.
+    // SKIP_API_SYNC_ON_RECONNECT: process.env.SKIP_API_SYNC_ON_RECONNECT === 'true',
 
     CLIENT_DATA_BASE_DIR,
     CLIENT_CODE_DIR: path.join(ROOT_DIR, 'client-instance'),
 
-    DEFAULT_PHONE_COUNTRY_CODE: '967',
+    DEFAULT_PHONE_COUNTRY_CODE: '967', // Default for Yemen
 
-    API_SYNC_INTERVAL_MS: 3600000,
-    RECONNECT_DELAY_MS: 5000,
-    MESSAGE_PROCESS_TIMEOUT_MS: 30000,
+    API_SYNC_INTERVAL_MS: 3600000, // 1 hour
+    RECONNECT_DELAY_MS: 5000, // 5 seconds
+    MESSAGE_PROCESS_TIMEOUT_MS: 30000, // 30 seconds
 };

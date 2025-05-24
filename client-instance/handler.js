@@ -3,111 +3,88 @@ const { getContentType, jidNormalizedUser, areJidsSameUser } = require('@whiskey
 
 const { addToWhitelist, removeFromWhitelist, formatJid } = require('./plugins/whitelist');
 const forwarderPlugin = require('./plugins/forwrder.js');
-const withdrawalRequestsPlugin = require('./plugins/withdrawalRequests.js'); // NEW: Import withdrawalRequestsPlugin
+const withdrawalRequestsPlugin = require('./plugins/withdrawalRequests.js');
 
 const ALL_HANDLERS_FROM_PLUGINS = [
-    // NEW: Add the withdrawalRequestsPlugin here.
-    // It MUST come BEFORE the _whitelistFilter.js if you want it to block messages
-    // before whitelist checks (e.g., if withdrawal requests can bypass whitelist).
-    // If whitelist must ALWAYS apply, put it AFTER _whitelistFilter.js.
-    // Given its nature, it likely needs to process messages from non-whitelisted users,
-    // so placing it before _whitelistFilter.js is logical if it has its own filtering.
-    // However, if withdrawal requests *must* come from whitelisted users/groups,
-    // then it should come after _whitelistFilter.js.
-    // Let's assume it should run *before* the general whitelist for now, as it might
-    // have its own filtering for "special" commands.
-    withdrawalRequestsPlugin.all, // NEW
-    require('./plugins/_whitelistFilter.js').all, // Existing whitelist filter
-    forwarderPlugin.all // Existing forwarder plugin
+    withdrawalRequestsPlugin.all,
+    require('./plugins/_whitelistFilter.js').all,
+    forwarderPlugin.all
 ];
 
-
 async function handleMessage(sock, m, options = {}) {
-    if (!m.message) {
+    // Determine if this is an internal command from the manager vs a WhatsApp message
+    const isInternalCommand = options.isInternalCommand || false;
+    const internalReply = options.internalReply || null; // Function to send a WebSocket reply back to Manager
+
+    if (!isInternalCommand && !m.message) {
         console.log("[HANDLER] Message object is empty, skipping.");
         return;
     }
-    const msgType = getContentType(m.message);
+    const msgType = isInternalCommand ? 'internalCommand' : getContentType(m.message);
     if (!msgType) {
         console.warn("[HANDLER] Could not determine message type, skipping.");
         return;
     }
 
-    if (msgType === 'protocolMessage' || msgType === 'senderKeyDistributionMessage') {
+    if (!isInternalCommand && (msgType === 'protocolMessage' || msgType === 'senderKeyDistributionMessage')) {
         console.log(`[HANDLER] Ignoring protocol/senderKeyDistribution message type: ${msgType}`);
         return;
     }
 
-    const chatId = m.key.remoteJid;
-    // initialSenderFromMessageKey: The raw sender ID from the message, could be a JID or a LID.
-    const initialSenderFromMessageKey = jidNormalizedUser(m.key.participant || m.key.remoteJid);
-    const isGroup = chatId.endsWith('@g.us');
+    const chatId = m.key?.remoteJid;
+    const initialSenderFromMessageKey = jidNormalizedUser(m.key?.participant || m.key?.remoteJid || (sock.user && sock.user.id));
+    const isGroup = chatId?.endsWith('@g.us') || false; // Handle internal commands which might not have a chatId
 
-    // actualSenderForLogic: This will be the ID used for all checks and passed to plugins.
-    // Initialize with the raw sender, will try to resolve it to canonical JID.
-    let actualSenderForLogic = initialSenderFromMessageKey; 
+    let actualSenderForLogic = initialSenderFromMessageKey;
 
-    // --- Start: Owner check, prioritizing the bot's own linked ID ---
-    let isOwner = false;
-    const botCanonicalJid = sock.user && sock.user.id ? jidNormalizedUser(sock.user.id) : null;
-    const botLid = sock.user && sock.user.lid ? jidNormalizedUser(sock.user.lid) : null;
+    let isOwner = options.isOwner || false; // `isOwner` can be passed in `options` for internal commands.
+    if (!isOwner) { // Recalculate if not provided (for regular WA messages)
+        const botCanonicalJid = sock.user && sock.user.id ? jidNormalizedUser(sock.user.id) : null;
+        const botLid = sock.user && sock.user.lid ? jidNormalizedUser(sock.user.lid) : null;
 
-    // Check if the sender is the bot's own linked number (which is also an owner by default)
-    if (botCanonicalJid && (areJidsSameUser(initialSenderFromMessageKey, botCanonicalJid) ||
-                             (botLid && areJidsSameUser(initialSenderFromMessageKey, botLid)))) {
-        isOwner = true;
-        actualSenderForLogic = botCanonicalJid; // Always use the canonical JID if it's the bot itself
-        console.log(`[HANDLER_OWNER_PRIMARY] Sender (${initialSenderFromMessageKey}) identified as bot's own linked number/owner. Resolved JID: ${actualSenderForLogic}.`);
-    } else {
-        // Fallback for cases where owner might be different from bot's linked number (if bot is not the owner's number),
-        // or just to verify with configured owner numbers.
-        const ownerPhoneNumberStrings = (process.env.OWNER_NUMBER_FOR_CLIENT_BOT_LOGIC || "")
-            .split(',')
-            .map(num => num.trim().replace(/@s\.whatsapp\.net$/, '')) // Extract only the number part
-            .filter(num => num);
+        if (botCanonicalJid && (areJidsSameUser(initialSenderFromMessageKey, botCanonicalJid) ||
+                                 (botLid && areJidsSameUser(initialSenderFromMessageKey, botLid)))) {
+            isOwner = true;
+            actualSenderForLogic = botCanonicalJid;
+        } else {
+            const ownerPhoneNumberStrings = (process.env.OWNER_NUMBER_FOR_CLIENT_BOT_LOGIC || "")
+                .split(',')
+                .map(num => num.trim().replace(/@s\.whatsapp\.net$/, ''))
+                .filter(num => num);
 
-        for (const ownerPhone of ownerPhoneNumberStrings) {
-            if (ownerPhone) {
-                const configuredOwnerJid = jidNormalizedUser(`${ownerPhone}@s.whatsapp.net`);
-                if (areJidsSameUser(initialSenderFromMessageKey, configuredOwnerJid)) {
-                    isOwner = true;
-                    // Attempt to use canonical JID from config, otherwise keep initial sender ID for consistency.
-                    // This might be redundant if the initialSenderFromMessageKey itself is the canonical one,
-                    // but safer in case Baileys reports a LID for a non-bot-owner in group metadata.
-                    actualSenderForLogic = configuredOwnerJid; 
-                    console.log(`[HANDLER_OWNER_FALLBACK] Sender (${initialSenderFromMessageKey}) matched configured owner (${configuredOwnerJid}).`);
-                    break;
+            for (const ownerPhone of ownerPhoneNumberStrings) {
+                if (ownerPhone) {
+                    const configuredOwnerJid = jidNormalizedUser(`${ownerPhone}@s.whatsapp.net`);
+                    if (areJidsSameUser(initialSenderFromMessageKey, configuredOwnerJid)) {
+                        isOwner = true;
+                        actualSenderForLogic = configuredOwnerJid;
+                        break;
+                    }
                 }
             }
         }
     }
-    // --- End: Owner check ---
-
 
     let groupMetadata = {};
     let participants = [];
     let isBotAdmin = false;
-    let isAdminOfGroup = false; 
+    let isAdminOfGroup = false;
 
     if (isGroup) {
         try {
-            // Attempt to fetch group metadata
             groupMetadata = await sock.groupMetadata(chatId);
             participants = groupMetadata.participants || [];
 
-            // If `actualSenderForLogic` is still a LID and not yet an owner (covered by primary owner check)
-            // try to resolve from group participants (only if not already canonical bot JID)
             if (actualSenderForLogic.endsWith('@lid') && !isOwner) { 
                  const senderParticipantInfo = participants.find(p => p && p.id && areJidsSameUser(p.id, initialSenderFromMessageKey));
                  if (senderParticipantInfo && senderParticipantInfo.id) {
                      actualSenderForLogic = jidNormalizedUser(senderParticipantInfo.id);
-                     console.log(`[HANDLER_DETAIL] Resolved group participant LID (${initialSenderFromMessageKey}) to JID (${actualSenderForLogic}).`);
                  } else {
                      console.warn(`[HANDLER_WARN] Could not find full participant info for '${initialSenderFromMessageKey}' in group '${groupMetadata.subject || chatId}'. Using initial ID. (Possible LID or missing participant data)`);
                  }
             }
 
-            const botJid = jidNormalizedUser(sock.user?.id); // Re-get it, already normalized
+            const botJid = jidNormalizedUser(sock.user?.id);
             const botParticipant = participants.find(p => p && p.id && areJidsSameUser(p.id, botJid));
             isBotAdmin = !!(botParticipant && (botParticipant.admin === 'admin' || botParticipant.admin === 'superadmin'));
 
@@ -117,22 +94,32 @@ async function handleMessage(sock, m, options = {}) {
             console.log(`[HANDLER_DETAIL] Group Info: ${groupMetadata.subject || chatId}, Bot Admin: ${isBotAdmin}, Sender Admin: ${isAdminOfGroup} (Sender ID resolved to: ${actualSenderForLogic.split('@')[0]})`);
 
         } catch (e) {
-            // CRITICAL FIX: If groupMetadata fetching fails, DO NOT block or reset `isOwner`.
             console.error(`[HANDLER_ERROR] Could not fetch group metadata or participant info for ${chatId}. Reason: ${e.message}.`);
-            // `actualSenderForLogic` retains its value from the initial (and potentially owner) check.
         }
     }
 
-    // Final consolidated log of resolved sender, helpful for debugging
-    console.log(`[HANDLER] MSG From: ${actualSenderForLogic.split('@')[0]} (Initial Key: ${initialSenderFromMessageKey}, Resolved ID: ${actualSenderForLogic}) in ${isGroup ? 'Group: ' + (groupMetadata.subject || chatId.split('@')[0]) : 'DM'}. IsOwner: ${isOwner}. Text: "${m.message?.conversation || m.message?.[msgType]?.text || m.message?.[msgType]?.caption || ''}"`);
+    const ctx = {
+        sock,
+        m,
+        chatId,
+        sender: actualSenderForLogic,
+        text: m.message?.conversation || m.message?.[msgType]?.text || m.message?.[msgType]?.caption || '',
+        usedPrefix: '!',
+        isGroup,
+        participants,
+        groupMetadata,
+        isAdmin: isAdminOfGroup,
+        isBotAdmin,
+        isOwner,
+        botJid: jidNormalizedUser(sock.user?.id), // Canonical JID of the bot itself
+    };
 
-    m.reply = (text, targetChatId = m.key.remoteJid, replyOptions = {}) => sock.sendMessage(targetChatId, (typeof text === 'string') ? { text: text } : text, { quoted: m, ...replyOptions });
+    m.reply = (text, targetChatId = m.key?.remoteJid || ctx.chatId, replyOptions = {}) => sock.sendMessage(targetChatId, (typeof text === 'string') ? { text: text } : text, { quoted: m, ...replyOptions });
 
     const msgContextInfo = m.message?.[msgType]?.contextInfo;
     m.mentionedJid = msgContextInfo?.mentionedJid || [];
 
     if (m.message?.[msgType]?.contextInfo?.quotedMessage) {
-        console.log("[HANDLER] Message is a reply.");
         m.quoted = {
             key: {
                 remoteJid: m.key.remoteJid,
@@ -140,41 +127,103 @@ async function handleMessage(sock, m, options = {}) {
                 participant: m.message[msgType].contextInfo.participant
             },
             message: m.message[msgType].contextInfo.quotedMessage,
-            sender: jidNormalizedUser(m.message[msgType].contextInfo.participant), // Correctly normalize quoted sender
+            sender: jidNormalizedUser(m.message[msgType].contextInfo.participant),
         };
     }
     if (m.message?.[msgType]?.mimetype) {
-        console.log(`[HANDLER] Message contains media: ${msgType}`);
          m.download = () => require('@whiskeysockets/baileys').downloadContentFromMessage(m.message[msgType], msgType.replace('Message', ''));
     }
 
-    // Construct the context object (ctx) that is passed to plugins
-    const ctx = {
-        sock,
-        m,
-        chatId,
-        sender: actualSenderForLogic, // IMPORTANT: Use the final, most resolved sender ID
-        text: m.message?.conversation || m.message?.[msgType]?.text || m.message?.[msgType]?.caption || '',
-        usedPrefix: '!',
-        isGroup,
-        participants, // May be empty if group metadata failed
-        groupMetadata, // May be empty if group metadata failed
-        isAdmin: isAdminOfGroup, // Only true if group metadata was successfully fetched and sender is admin
-        isBotAdmin, // Only true if group metadata was successfully fetched and bot is admin
-        isOwner, // This is now accurately derived (from bot's own credentials or owner config)
-        botJid: botCanonicalJid, // Canonical JID of the bot itself
-    };
+    // --- NEW: Internal Command Handling ---
+    if (isInternalCommand) {
+        console.log(`[HANDLER] Processing internal command: ${options.command} for client ${options.clientId}`);
+        switch (options.command) {
+            case 'fetchGroups':
+                if (!ctx.isOwner) {
+                     if (internalReply) internalReply({ type: 'error', message: 'Unauthorized: Not owner of this bot.', clientId: options.clientId });
+                     return;
+                }
+                try {
+                    const groups = await sock.groupFetchAllParticipating();
+                    const formattedGroups = Object.values(groups).map(g => ({
+                        id: g.id,
+                        subject: g.subject,
+                        participantsCount: g.participants.length
+                    }));
+                    if (internalReply) internalReply({ type: 'groupsList', groups: formattedGroups, clientId: options.clientId });
+                    console.log(`[HANDLER_INTERNAL] Fetched ${formattedGroups.length} groups for ${options.clientId}.`);
+                } catch (e) {
+                    console.error(`[HANDLER_INTERNAL_ERROR] Failed to fetch groups for ${options.clientId}:`, e);
+                    if (internalReply) internalReply({ type: 'error', message: `Failed to fetch groups: ${e.message}`, clientId: options.clientId });
+                }
+                return;
+
+            case 'addChatToWhitelist': // For internal calls directly whitelisting a group ID from UI
+                if (!ctx.isOwner) {
+                     if (internalReply) internalReply({ type: 'error', message: 'Unauthorized: Not owner of this bot.', clientId: options.clientId });
+                     return;
+                }
+                const groupIdToAdd = options.groupId;
+                if (!groupIdToAdd) {
+                    if (internalReply) internalReply({ type: 'error', message: 'Group ID is required for whitelisting.', clientId: options.clientId });
+                    return;
+                }
+                const addResult = addToWhitelist(groupIdToAdd);
+                if (internalReply) internalReply({
+                    type: 'addChatToWhitelistResponse',
+                    success: addResult.success,
+                    reason: addResult.reason,
+                    jid: groupIdToAdd,
+                    typeOfItem: 'group',
+                    clientId: options.clientId
+                });
+                console.log(`[HANDLER_INTERNAL] Whitelist group result for ${groupIdToAdd}: ${addResult.success}`);
+                return;
+
+            case 'fetchParticipants':
+                if (!ctx.isOwner) {
+                    if (internalReply) internalReply({ type: 'error', message: 'Unauthorized: Not owner of this bot.', clientId: options.clientId });
+                    return;
+                }
+                const groupJid = options.groupId;
+                if (!groupJid) {
+                    if (internalReply) internalReply({ type: 'error', message: 'Group ID is required for fetching participants.', clientId: options.clientId });
+                    return;
+                }
+                try {
+                    const groupMetadata = await sock.groupMetadata(groupJid);
+                    const participants = groupMetadata.participants.map(p => ({
+                        jid: jidNormalizedUser(p.id),
+                        isAdmin: (p.admin === 'admin' || p.admin === 'superadmin')
+                    }));
+                    if (internalReply) internalReply({ type: 'participantsList', participants: participants, groupId: groupJid, clientId: options.clientId });
+                    console.log(`[HANDLER_INTERNAL] Fetched ${participants.length} participants for ${groupJid}.`);
+                } catch (e) {
+                    console.error(`[HANDLER_INTERNAL_ERROR] Failed to fetch participants for ${groupJid}:`, e);
+                    if (internalReply) internalReply({ type: 'error', message: `Failed to fetch participants: ${e.message}`, clientId: options.clientId });
+                }
+                return;
+
+            default:
+                console.warn(`[HANDLER] Unrecognized internal command: ${options.command}`);
+                if (internalReply) internalReply({ type: 'error', message: `Unrecognized internal command: ${options.command}`, clientId: options.clientId });
+                return;
+        }
+    }
+    // --- END NEW Internal Command Handling ---
+
+    // Final consolidated log of resolved sender, helpful for debugging
+    console.log(`[HANDLER] MSG From: ${actualSenderForLogic.split('@')[0]} (Initial Key: ${initialSenderFromMessageKey}, Resolved ID: ${actualSenderForLogic}) in ${isGroup ? 'Group: ' + (groupMetadata.subject || chatId.split('@')[0]) : 'DM'}. IsOwner: ${isOwner}. Text: "${m.message?.conversation || m.message?.[msgType]?.text || m.message?.[msgType]?.caption || ''}"`);
+
 
     // --- Run 'all' plugins, like _whitelistFilter.js ---
     for (const allHandler of ALL_HANDLERS_FROM_PLUGINS) {
         console.log(`[HANDLER] Running 'all' plugin: ${allHandler.name || 'Anonymous'}`);
         try {
-            // If a plugin returns an empty object, it means it handled the message
-            // and no further processing should occur.
             const blockResult = await allHandler(m, ctx); 
             if (blockResult && typeof blockResult === 'object' && Object.keys(blockResult).length === 0) {
                 console.log(`[HANDLER] Message blocked by 'all' plugin (${allHandler.name || 'Anonymous'}). Halting further processing.`);
-                return; // Stop processing further plugins and commands
+                return;
             }
         } catch (e) {
             console.error(`[HANDLER_ERROR] Error in 'all' plugin (${allHandler.name || 'Anonymous'}):`, e);
@@ -185,8 +234,8 @@ async function handleMessage(sock, m, options = {}) {
     const command = ctx.text.split(' ')[0];
     const args = ctx.text.split(' ').slice(1);
 
-    if (ctx.isOwner) { // This now uses the robust isOwner check
-        console.log(`[HANDLER] Owner command received: ${command}. Executing...`); // Added log
+    if (ctx.isOwner) {
+        console.log(`[HANDLER] Owner command received: ${command}. Executing...`);
         switch (command) {
             case '!whitelistgroup':
                 if (ctx.isGroup) {
@@ -229,26 +278,16 @@ async function handleMessage(sock, m, options = {}) {
                     const numberToAdd = args[0];
                     const jidToAdd = formatJid(numberToAdd);
 
-                    if (jidToAdd.endsWith('@s.whatsapp.net')) {
+                    if (jidToAdd.endsWith('@s.whatsapp.net') || jidToAdd.endsWith('@g.us')) { // Handle both user and group JIDs
                         const addResult = addToWhitelist(jidToAdd);
                         if (addResult.success) {
-                            m.reply(`User ${jidToAdd.split('@')[0]} added to general whitelist.`);
-                            console.log(`[HANDLER] Whitelisted user: ${jidToAdd}`);
+                            m.reply(`${jidToAdd.endsWith('@s.whatsapp.net') ? 'User' : 'Group'} ${jidToAdd.split('@')[0]} added to general whitelist.`);
+                            console.log(`[HANDLER] Whitelisted ${jidToAdd.endsWith('@s.whatsapp.net') ? 'user' : 'group'}: ${jidToAdd}`);
                         } else {
-                            m.reply(`Failed to add user to general whitelist: ${addResult.reason}`);
-                            console.error(`[HANDLER] Failed to whitelist user ${jidToAdd}: ${addResult.reason}`);
+                            m.reply(`Failed to add ${jidToAdd.endsWith('@s.whatsapp.net') ? 'user' : 'group'} to general whitelist: ${addResult.reason}`);
+                            console.error(`[HANDLER] Failed to whitelist ${jidToAdd.endsWith('@s.whatsapp.net') ? 'user' : 'group'} ${jidToAdd}: ${addResult.reason}`);
                         }
-                    } else if (jidToAdd.endsWith('@g.us')) { // Allow group JID for direct whitelist
-                         const addResult = addToWhitelist(jidToAdd);
-                         if (addResult.success) {
-                             m.reply(`Group ${jidToAdd.split('@')[0]} added to general whitelist.`);
-                             console.log(`[HANDLER] Whitelisted group: ${jidToAdd}`);
-                         } else {
-                             m.reply(`Failed to add group to general whitelist: ${addResult.reason}`);
-                             console.error(`[HANDLER] Failed to whitelist group ${jidToAdd}: ${addResult.reason}`);
-                         }
-                    }
-                    else {
+                    } else {
                         m.reply(`Invalid number format. Please provide a valid phone number or group JID.`);
                         console.warn(`[HANDLER] Invalid format for !addtochatwhitelist: ${numberToAdd}`);
                     }
@@ -263,26 +302,16 @@ async function handleMessage(sock, m, options = {}) {
                     const numberToRemove = args[0];
                     const jidToRemove = formatJid(numberToRemove);
 
-                    if (jidToRemove.endsWith('@s.whatsapp.net')) {
+                    if (jidToRemove.endsWith('@s.whatsapp.net') || jidToRemove.endsWith('@g.us')) {
                         const removeResult = removeFromWhitelist(jidToRemove);
                         if (removeResult.success) {
-                            m.reply(`User ${jidToRemove.split('@')[0]} removed from general whitelist.`);
-                            console.log(`[HANDLER] Removed user from general whitelist: ${jidToRemove}`);
+                            m.reply(`${jidToRemove.endsWith('@s.whatsapp.net') ? 'User' : 'Group'} ${jidToRemove.split('@')[0]} removed from general whitelist.`);
+                            console.log(`[HANDLER] Removed ${jidToRemove.endsWith('@s.whatsapp.net') ? 'user' : 'group'} from general whitelist: ${jidToRemove}`);
                         } else {
-                            m.reply(`Failed to remove user from general whitelist: ${removeResult.reason}`);
-                            console.error(`[HANDLER] Failed to remove user ${jidToRemove}: ${removeResult.reason}`);
+                            m.reply(`Failed to remove ${jidToRemove.endsWith('@s.whatsapp.net') ? 'user' : 'group'} from general whitelist: ${removeResult.reason}`);
+                            console.error(`[HANDLER] Failed to remove ${jidToRemove.endsWith('@s.whatsapp.net') ? 'user' : 'group'} ${jidToRemove}: ${removeResult.reason}`);
                         }
-                    } else if (jidToRemove.endsWith('@g.us')) { // Allow group JID for direct removal
-                         const removeResult = removeFromWhitelist(jidToRemove);
-                         if (removeResult.success) {
-                             m.reply(`Group ${jidToRemove.split('@')[0]} removed from general whitelist.`);
-                             console.log(`[HANDLER] Removed group ${jidToRemove} from general whitelist.`);
-                         } else {
-                             m.reply(`Failed to remove group from general whitelist: ${removeResult.reason}`);
-                             console.error(`[HANDLER] Failed to remove group ${jidToRemove}: ${removeResult.reason}`);
-                         }
-                    }
-                    else {
+                    } else {
                         m.reply(`Invalid number format. Please provide a valid phone number or group JID.`);
                         console.warn(`[HANDLER] Invalid format for removefromchatwhitelist: ${numberToRemove}`);
                     }

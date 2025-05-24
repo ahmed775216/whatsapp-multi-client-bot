@@ -12,12 +12,10 @@ console.log('--- Starting WhatsApp Bot Manager ---');
 function handleQrRequest(apiUsername, apiPassword, ownerNumber) {
     const linkingClientId = instanceManager.generateClientId('new_linking_num');
     
-    // --- DEBUG LOG START ---
     console.log(`[MANAGER_DEBUG] handleQrRequest received:`);
     console.log(`[MANAGER_DEBUG]   API Username: ${apiUsername ? apiUsername.substring(0,3) + '***' : 'NULL'}`);
     console.log(`[MANAGER_DEBUG]   API Password: ${apiPassword ? '*** (Set)' : 'NULL'}`);
     console.log(`[MANAGER_DEBUG]   Owner Number: ${ownerNumber ? ownerNumber.substring(0,3) + '***' : 'NULL'}`);
-    // --- DEBUG LOG END ---
 
     console.log(`[MANAGER] C# app requested QR. Launching temporary client: ${linkingClientId} with API user: ${apiUsername ? 'Provided' : 'None'}, Owner: ${ownerNumber ? 'Provided' : 'None'}`);
     
@@ -37,12 +35,10 @@ const wsCallbacks = {
     onQrRequested: (apiUsername, apiPassword, ownerNumber) => handleQrRequest(apiUsername, apiPassword, ownerNumber),
     onManualRelink: (apiUsername, apiPassword, ownerNumber) => {
         console.log('[MANAGER] C# app requested manual re-link (logout/new QR).');
-        // --- DEBUG LOG START ---
         console.log(`[MANAGER_DEBUG] onManualRelink received:`);
         console.log(`[MANAGER_DEBUG]   API Username: ${apiUsername ? apiUsername.substring(0,3) + '***' : 'NULL'}`);
         console.log(`[MANAGER_DEBUG]   API Password: ${apiPassword ? '*** (Set)' : 'NULL'}`);
         console.log(`[MANAGER_DEBUG]   Owner Number: ${ownerNumber ? ownerNumber.substring(0,3) + '***' : 'NULL'}`);
-        // --- DEBUG LOG END ---
         const currentUiLinkingClientId = qrWebSocketServer.managerQrState?.linkingClientId;
         if (currentUiLinkingClientId) {
             instanceManager.stopClientInstance(currentUiLinkingClientId);
@@ -65,8 +61,27 @@ const wsCallbacks = {
         console.log(`[MANAGER] Sent instance list to C# client.`);
     },
     onStartInstance: (clientId) => {
-        instanceManager.restartClientInstance(clientId);
-        console.log(`[MANAGER] Received request to start instance: ${clientId}`);
+        // Find the instance to get its original launch parameters (username, password, owner)
+        const instance = instanceManager.ACTIVE_BOT_INSTANCES[clientId];
+        if (instance) {
+             console.log(`[MANAGER] Received request to start instance: ${clientId}. Launching with stored credentials.`);
+             // Pass stored credentials directly to launchClientInstance
+             instanceManager.launchClientInstance(
+                 clientId,
+                 instance.phoneNumber, // Use stored phone number
+                 false, // No force new scan on manual start
+                 instance.apiUsername,
+                 instance.apiPassword,
+                 instance.ownerNumber
+             );
+        } else {
+             console.warn(`[MANAGER] Attempted to start unknown or previously deleted client: ${clientId}. If folder exists, it will try to recover.`);
+             // If not in ACTIVE_BOT_INSTANCES, it might be a clean restart from persistent storage.
+             // Rely on `recoverExistingClientInstances` logic to pick up saved `client_config.json`.
+             // We can trigger `recoverExistingClientInstances` here, but it's heavier.
+             // Simpler: assume UI clicked start only on what is in list, or user knows best.
+             // Relaunching an already-tracked but 'stopped' process is handled in instanceManager.
+        }
     },
     onStopInstance: (clientId) => {
         instanceManager.stopClientInstance(clientId);
@@ -76,10 +91,23 @@ const wsCallbacks = {
         instanceManager.restartClientInstance(clientId);
         console.log(`[MANAGER] Received request to restart instance: ${clientId}`);
     },
+    onDeleteInstance: (clientId) => { // NEW CALLBACK
+        instanceManager.deleteClientInstance(clientId);
+        console.log(`[MANAGER] Received request to delete instance: ${clientId}`);
+    },
     onGetLogs: (ws, clientId) => {
         const logs = instanceManager.getInstanceLogs(clientId);
         qrWebSocketServer.sendToClient(ws, { type: 'instanceLogs', clientId: clientId, logs: logs });
         console.log(`[MANAGER] Sent logs for ${clientId} to C# client.`);
+    },
+    onFetchGroups: (clientId) => { // NEW CALLBACK FOR FETCHING GROUPS
+        instanceManager.sendInternalCommandToClient(clientId, { command: 'fetchGroups' });
+    },
+    onAddChatToWhitelist: (clientId, groupId) => { // NEW CALLBACK FOR ADDING GROUP TO WHITELIST
+        instanceManager.sendInternalCommandToClient(clientId, { command: 'addChatToWhitelist', groupId: groupId });
+    },
+    onFetchParticipants: (clientId, groupId) => { // NEW CALLBACK FOR FETCHING GROUP PARTICIPANTS
+        instanceManager.sendInternalCommandToClient(clientId, { command: 'fetchParticipants', groupId: groupId });
     }
 };
 
