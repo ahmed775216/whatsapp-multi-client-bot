@@ -1,15 +1,14 @@
 // client-instance/handler.js
-const { getContentType, jidNormalizedUser, areJidsSameUser } = require('@whiskeysockets/baileys'); // Make sure areJidsSameUser is imported
+const { getContentType, jidNormalizedUser, areJidsSameUser } = require('@whiskeysockets/baileys');
 
 const { addToWhitelist, removeFromWhitelist, formatJid } = require('./plugins/whitelist');
 const forwarderPlugin = require('./plugins/forwrder.js');
-
-const plugins = {};
 
 const ALL_HANDLERS_FROM_PLUGINS = [
     require('./plugins/_whitelistFilter.js').all,
     forwarderPlugin.all
 ];
+
 
 async function handleMessage(sock, m, options = {}) {
     if (!m.message) {
@@ -28,51 +27,90 @@ async function handleMessage(sock, m, options = {}) {
     }
 
     const chatId = m.key.remoteJid;
-    // Initial senderId from message key (could be JID or LID)
-    const initialSenderId = jidNormalizedUser(m.key.participant || m.key.remoteJid);
+    // initialSenderFromMessageKey: The raw sender ID from the message, could be a JID or a LID.
+    const initialSenderFromMessageKey = jidNormalizedUser(m.key.participant || m.key.remoteJid);
     const isGroup = chatId.endsWith('@g.us');
+
+    // actualSenderForLogic: This will be the ID used for all checks and passed to plugins.
+    // Initialize with the raw sender, will try to resolve it to canonical JID.
+    let actualSenderForLogic = initialSenderFromMessageKey; 
+
+    // --- Start: Owner check, prioritizing the bot's own linked ID ---
+    let isOwner = false;
+    const botCanonicalJid = sock.user && sock.user.id ? jidNormalizedUser(sock.user.id) : null;
+    const botLid = sock.user && sock.user.lid ? jidNormalizedUser(sock.user.lid) : null;
+
+    if (botCanonicalJid && (areJidsSameUser(initialSenderFromMessageKey, botCanonicalJid) ||
+                             (botLid && areJidsSameUser(initialSenderFromMessageKey, botLid)))) {
+        isOwner = true;
+        actualSenderForLogic = botCanonicalJid; // Always use the canonical JID if it's the bot itself
+        console.log(`[HANDLER_OWNER_PRIMARY] Sender (${initialSenderFromMessageKey}) identified as bot's own linked number/owner. Resolved JID: ${actualSenderForLogic}.`);
+    } else {
+        // Fallback for cases where owner might be different from bot's linked number, or just to verify with config.
+        const ownerPhoneNumberStrings = (process.env.OWNER_NUMBER_FOR_CLIENT_BOT_LOGIC || "")
+            .split(',')
+            .map(num => num.trim().replace(/@s\.whatsapp\.net$/, '')) // Extract only the number part
+            .filter(num => num);
+
+        for (const ownerPhone of ownerPhoneNumberStrings) {
+            if (ownerPhone) {
+                const configuredOwnerJid = jidNormalizedUser(`${ownerPhone}@s.whatsapp.net`);
+                if (areJidsSameUser(initialSenderFromMessageKey, configuredOwnerJid)) {
+                    isOwner = true;
+                    // Attempt to use canonical JID from config, otherwise keep initial sender ID for consistency.
+                    // This might be redundant if the initialSenderFromMessageKey itself is the canonical one,
+                    // but safer in case Baileys reports a LID for a non-bot-owner in group metadata.
+                    actualSenderForLogic = configuredOwnerJid; 
+                    console.log(`[HANDLER_OWNER_FALLBACK] Sender (${initialSenderFromMessageKey}) matched configured owner (${configuredOwnerJid}).`);
+                    break;
+                }
+            }
+        }
+    }
+    // --- End: Owner check ---
+
 
     let groupMetadata = {};
     let participants = [];
-    let isAdmin = false;
     let isBotAdmin = false;
-    let actualSenderJid = initialSenderId; // This will hold the resolved JID
+    let isAdminOfGroup = false; 
 
     if (isGroup) {
         try {
+            // Attempt to fetch group metadata
             groupMetadata = await sock.groupMetadata(chatId);
             participants = groupMetadata.participants || [];
 
-            // --- VITAL CHANGE: Resolve actual JID of the sender ---
-            const senderParticipantInfo = participants.find(p => areJidsSameUser(p.id, initialSenderId));
-            if (senderParticipantInfo && senderParticipantInfo.id) {
-                actualSenderJid = jidNormalizedUser(senderParticipantInfo.id); // Use the ID from metadata
-                console.log(`[HANDLER_DETAIL] Sender ID resolution in group ${groupMetadata.subject}: Initial='${initialSenderId}', Resolved='${actualSenderJid}'`);
-            } else {
-                console.warn(`[HANDLER_WARN] Could not find participant info for '${initialSenderId}' in group '${groupMetadata.subject || chatId}'. Using initial ID.`);
+            // If `actualSenderForLogic` is still a LID and not yet an owner (covered by primary owner check)
+            // try to resolve from group participants (only if not already canonical bot JID)
+            if (actualSenderForLogic.endsWith('@lid') && !isOwner) { 
+                 const senderParticipantInfo = participants.find(p => p && p.id && areJidsSameUser(p.id, initialSenderFromMessageKey));
+                 if (senderParticipantInfo && senderParticipantInfo.id) {
+                     actualSenderForLogic = jidNormalizedUser(senderParticipantInfo.id);
+                     console.log(`[HANDLER_DETAIL] Resolved group participant LID (${initialSenderFromMessageKey}) to JID (${actualSenderForLogic}).`);
+                 } else {
+                     console.warn(`[HANDLER_WARN] Could not find full participant info for '${initialSenderFromMessageKey}' in group '${groupMetadata.subject || chatId}'. Using initial ID. (Possible LID or missing participant data)`);
+                 }
             }
-            // --- END VITAL CHANGE ---
 
-            const botJid = jidNormalizedUser(sock.user?.id);
-            const botParticipant = participants.find(p => areJidsSameUser(p.id, botJid));
+            const botJid = jidNormalizedUser(sock.user?.id); // Re-get it, already normalized
+            const botParticipant = participants.find(p => p && p.id && areJidsSameUser(p.id, botJid));
             isBotAdmin = !!(botParticipant && (botParticipant.admin === 'admin' || botParticipant.admin === 'superadmin'));
 
-            // Use actualSenderJid for isAdmin check as well
-            const senderAdminInfo = participants.find(p => areJidsSameUser(p.id, actualSenderJid));
-            isAdmin = !!(senderAdminInfo && (senderAdminInfo.admin === 'admin' || senderAdminInfo.admin === 'superadmin'));
+            const senderAdminInfo = participants.find(p => p && p.id && areJidsSameUser(p.id, actualSenderForLogic));
+            isAdminOfGroup = !!(senderAdminInfo && (senderAdminInfo.admin === 'admin' || senderAdminInfo.admin === 'superadmin'));
             
+            console.log(`[HANDLER_DETAIL] Group Info: ${groupMetadata.subject || chatId}, Bot Admin: ${isBotAdmin}, Sender Admin: ${isAdminOfGroup} (Sender ID resolved to: ${actualSenderForLogic.split('@')[0]})`);
+
         } catch (e) {
-            console.warn(`[HANDLER_ERROR] Could not fetch group metadata or participant info for ${chatId}:`, e.message);
+            // CRITICAL FIX: If groupMetadata fetching fails, DO NOT block or reset `isOwner`.
+            console.error(`[HANDLER_ERROR] Could not fetch group metadata or participant info for ${chatId}. Reason: ${e.message}.`);
+            // `actualSenderForLogic` retains its value from the initial (and potentially owner) check.
         }
     }
-    // Else, for DMs, actualSenderJid remains initialSenderId (which is the user's JID)
 
-    const ownerNumbers = (process.env.OWNER_NUMBER_FOR_CLIENT_BOT_LOGIC || "").split(',').map(num => num.trim());
-    // --- Use actualSenderJid for isOwner check ---
-    const isOwner = ownerNumbers.includes(actualSenderJid.split('@')[0]);
-    // ---
-
-    console.log(`[HANDLER] Processing message from ${actualSenderJid.split('@')[0]} (Original sender ID from key: ${initialSenderId}) in ${isGroup ? 'group ' + (groupMetadata.subject || chatId.split('@')[0]) : 'DM'} (Is Owner: ${isOwner}). Text: "${m.message?.conversation || m.message?.[msgType]?.text || m.message?.[msgType]?.caption || ''}"`);
+    // Final consolidated log of resolved sender, helpful for debugging
+    console.log(`[HANDLER] MSG From: ${actualSenderForLogic.split('@')[0]} (Initial Key: ${initialSenderFromMessageKey}, Resolved ID: ${actualSenderForLogic}) in ${isGroup ? 'Group: ' + (groupMetadata.subject || chatId.split('@')[0]) : 'DM'}. IsOwner: ${isOwner}. Text: "${m.message?.conversation || m.message?.[msgType]?.text || m.message?.[msgType]?.caption || ''}"`);
 
     m.reply = (text, targetChatId = m.key.remoteJid, replyOptions = {}) => sock.sendMessage(targetChatId, (typeof text === 'string') ? { text: text } : text, { quoted: m, ...replyOptions });
 
@@ -85,10 +123,9 @@ async function handleMessage(sock, m, options = {}) {
             key: {
                 remoteJid: m.key.remoteJid,
                 id: m.message[msgType].contextInfo.stanzaId,
-                participant: m.message[msgType].contextInfo.participant // This could also be a LID
+                participant: m.message[msgType].contextInfo.participant
             },
             message: m.message[msgType].contextInfo.quotedMessage,
-            // Resolve quoted sender's JID if needed, similar to main sender, for consistency
             sender: jidNormalizedUser(m.message[msgType].contextInfo.participant),
         };
     }
@@ -97,26 +134,28 @@ async function handleMessage(sock, m, options = {}) {
          m.download = () => require('@whiskeysockets/baileys').downloadContentFromMessage(m.message[msgType], msgType.replace('Message', ''));
     }
 
+    // Construct the context object (ctx) that is passed to plugins
     const ctx = {
         sock,
         m,
         chatId,
-        sender: actualSenderJid, // Pass the resolved JID to plugins
+        sender: actualSenderForLogic, // IMPORTANT: Use the final, most resolved sender ID
         text: m.message?.conversation || m.message?.[msgType]?.text || m.message?.[msgType]?.caption || '',
         usedPrefix: '!',
         isGroup,
-        participants,
-        groupMetadata,
-        isAdmin,
-        isBotAdmin,
-        isOwner,
-        botJid: jidNormalizedUser(sock.user?.id),
+        participants, // May be empty if group metadata failed
+        groupMetadata, // May be empty if group metadata failed
+        isAdmin: isAdminOfGroup, // Only true if group metadata was successfully fetched and sender is admin
+        isBotAdmin, // Only true if group metadata was successfully fetched and bot is admin
+        isOwner, // This is now accurately derived (from bot's own credentials or owner config)
+        botJid: botCanonicalJid,
     };
 
+    // --- Run 'all' plugins, like _whitelistFilter.js ---
     for (const allHandler of ALL_HANDLERS_FROM_PLUGINS) {
         console.log(`[HANDLER] Running 'all' plugin: ${allHandler.name || 'Anonymous'}`);
         try {
-            const blockResult = await allHandler(m, ctx); // m still has original sender, ctx.sender has resolved one
+            const blockResult = await allHandler(m, ctx); 
             if (blockResult && typeof blockResult === 'object' && Object.keys(blockResult).length === 0) {
                 console.log(`[HANDLER] Message blocked by 'all' plugin (${allHandler.name || 'Anonymous'}). Halting further processing.`);
                 return;
@@ -126,10 +165,11 @@ async function handleMessage(sock, m, options = {}) {
         }
     }
 
+    // --- Owner Commands (will now work as isOwner is correct) ---
     const command = ctx.text.split(' ')[0];
     const args = ctx.text.split(' ').slice(1);
 
-    if (ctx.isOwner) { // This now uses the correctly resolved owner status
+    if (ctx.isOwner) {
         console.log(`[HANDLER] Owner command received: ${command}`);
         switch (command) {
             case '!whitelistgroup':
@@ -150,7 +190,6 @@ async function handleMessage(sock, m, options = {}) {
                 }
                 break;
 
-            // ... (rest of your owner commands remain the same) ...
             case '!removegroup':
                 if (ctx.isGroup) {
                     const removeResult = removeFromWhitelist(ctx.chatId);
