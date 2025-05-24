@@ -18,13 +18,6 @@ const CLIENT_API_PASSWORD = process.env.API_PASSWORD_FOR_CLIENT_BOT_LOGIC;
 
 let apiToken = null;
 
-if (!global.userGroupPermissions) {
-    // This should ideally be loaded by whitelist.js (which requires it on startup)
-    // If you remove the direct require of whitelist.js from clientBotApp, ensure this initialization
-    // is triggered implicitly when clientBotApp uses a whitelist function.
-    // For now, whitelist.js will handle its own initialization when required for its functions.
-}
-
 function normalizePhoneNumberToJid(mobileNumber) {
     let cleanedNumber = mobileNumber.replace(/\D/g, '');
     
@@ -105,7 +98,7 @@ async function loginToApi() {
         const data = await response.json();
         if (data.token) {
             apiToken = data.token;
-            console.log(`[${process.env.CLIENT_ID}_API_SYNC] Login successful, token obtained. Token Length: ${apiToken.length > 0 ? 'Set' : 'Empty'}`);
+            console.log(`[${process.env.CLIENT_ID}_API_SYNC] Login successful, token obtained. Token Length: ${apiToken.length > 0 ? apiToken.length : '0'}`);
             return apiToken;
         }
         console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Login response missing token:`, JSON.stringify(data).substring(0, 200) + '...');
@@ -141,6 +134,11 @@ async function syncWhitelistFromApi() {
         console.log(`[${process.env.CLIENT_ID}_API_SYNC] API token already exists.`);
     }
 
+    if (!global.userGroupPermissions || typeof global.userGroupPermissions !== 'object') {
+        console.warn(`[${process.env.CLIENT_ID}_API_SYNC_WARN] global.userGroupPermissions was not initialized as an object. Initializing now.`);
+        global.userGroupPermissions = {}; 
+    }
+
     try {
         console.log(`[${process.env.CLIENT_ID}_API_SYNC] Fetching contacts from API endpoint: ${API_GET_CONTACTS_ENDPOINT}`);
         const response = await fetch(API_GET_CONTACTS_ENDPOINT, {
@@ -151,31 +149,30 @@ async function syncWhitelistFromApi() {
                 'Accept': 'application/json',
                 'User-Agent': 'WhatsApp-Bot-Client'
             },
-            redirect: 'manual' // Prevent automatic redirects
+            redirect: 'manual'
         });
         
         console.log(`[${process.env.CLIENT_ID}_API_SYNC] Get contacts API response status: ${response.status}`);
         console.log(`[${process.env.CLIENT_ID}_API_SYNC] Get contacts API response headers:`, Object.fromEntries(response.headers.entries()));
         
-        // Handle redirects manually
         if (response.status >= 300 && response.status < 400) {
             const location = response.headers.get('location');
             console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Get contacts endpoint redirected to: ${location}`);
             console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] This suggests the API endpoint URL might be incorrect or token is invalid.`);
-            apiToken = null; // Clear token to force re-login
+            apiToken = null;
             return;
         }
         
         if (!response.ok) {
             const errorText = await response.text();
             console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Fetch contacts failed: ${response.status} - ${errorText.substring(0, 500)}`);
+            console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Full non-OK response body:`, errorText);
             
             if (response.status === 401 || response.status === 403) {
                 console.warn(`[${process.env.CLIENT_ID}_API_SYNC] Token might be invalid for fetching contacts. Clearing token to force re-login.`);
                 apiToken = null;
             }
             
-            // Check if response indicates HTML
             if (errorText.includes('<!DOCTYPE html>') || errorText.includes('<html')) {
                 console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Get contacts response is HTML - likely wrong endpoint or server redirect.`);
                 console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Check if the API_BASE_URL is correct: ${API_BASE_URL}`);
@@ -188,11 +185,12 @@ async function syncWhitelistFromApi() {
             const responseText = await response.text();
             console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Get contacts response is not JSON. Content-Type: ${contentType}`);
             console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Response: ${responseText.substring(0, 200)}...`);
+            console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Full non-JSON response body:`, responseText);
             return;
         }
 
         const data = await response.json();
-        console.log(`[${process.env.CLIENT_ID}_API_SYNC] Raw API contact data (first 500 chars): ${JSON.stringify(data).substring(0, 500)}...`);
+        console.log(`[${process.env.CLIENT_ID}_API_SYNC_DEBUG] Full parsed API response for /get_contacts:`, JSON.stringify(data, null, 2));
 
         if (!data || !data.status || !Array.isArray(data.contacts)) {
             console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Invalid contacts API response structure. Expected 'status' and 'contacts' array. Received:`, JSON.stringify(data).substring(0, 200) + '...');
@@ -209,15 +207,47 @@ async function syncWhitelistFromApi() {
                 const jid = normalizePhoneNumberToJid(contact.mobile);
                 apiUserJidsProcessed.add(jid);
                 console.log(`[${process.env.CLIENT_ID}_API_SYNC_DETAIL] Processing contact: Mobile=${contact.mobile}, Normalized JID=${jid}, Active=${contact.active}`);
+                console.log(`[${process.env.CLIENT_ID}_API_SYNC_DETAIL] Contact data from API for ${jid}:`, contact); // Logs the individual contact object
 
                 if (contact.active === true) {
                     const addResult = addToWhitelist(jid);
                     if (addResult.success || addResult.reason === 'already_whitelisted') {
-                        if (global.userGroupPermissions[jid] !== contact.allowed_in_groups) {
-                            global.userGroupPermissions[jid] = contact.allowed_in_groups;
-                            updatedUserPerms++;
+                        if (!global.userGroupPermissions[jid] || typeof global.userGroupPermissions[jid] !== 'object') {
+                            console.log(`[${process.env.CLIENT_ID}_API_SYNC_DEBUG] Initializing permissions object for ${jid}.`);
+                            global.userGroupPermissions[jid] = {};
+                        }
+                        
+                        let updated = false;
+
+                        if (global.userGroupPermissions[jid].allowed_in_groups !== contact.allowed_in_groups) {
+                            global.userGroupPermissions[jid].allowed_in_groups = contact.allowed_in_groups;
+                            updated = true;
                             console.log(`[${process.env.CLIENT_ID}_API_SYNC_DETAIL] Updated group permission for ${jid} to ${contact.allowed_in_groups}`);
                         }
+
+                        // --- CRITICAL FIX: Update contact_id (using 'id' from API response) ---
+                        // Check if contact.id exists and is not null/undefined
+                        if (contact.id !== undefined && contact.id !== null) {
+                            if (global.userGroupPermissions[jid].contact_id !== contact.id) {
+                                global.userGroupPermissions[jid].contact_id = contact.id; // Assign contact.id to global.userGroupPermissions[jid].contact_id
+                                updated = true;
+                                console.log(`[${process.env.CLIENT_ID}_API_SYNC_DETAIL] Updated contact_id for ${jid} to ${contact.id}.`);
+                            } else {
+                                console.log(`[${process.env.CLIENT_ID}_API_SYNC_DETAIL] contact_id for ${jid} is already ${contact.id}.`);
+                            }
+                        } else {
+                            console.warn(`[${process.env.CLIENT_ID}_API_SYNC_WARNING] API contact for ${jid} is missing 'id' property. (No value or null)`);
+                            // Optionally, if contact_id was present before but now missing from API response, remove it
+                            if (global.userGroupPermissions[jid].contact_id !== undefined) {
+                                delete global.userGroupPermissions[jid].contact_id;
+                                updated = true;
+                                console.log(`[${process.env.CLIENT_ID}_API_SYNC_DETAIL] Removed 'contact_id' for ${jid} as 'id' is missing from API response.`);
+                            }
+                        }
+                        // --- END CRITICAL FIX ---
+
+                        if (updated) updatedUserPerms++;
+
                     } else {
                         console.warn(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Failed to add active user ${jid} to general whitelist: ${addResult.reason}`);
                     }
@@ -235,7 +265,7 @@ async function syncWhitelistFromApi() {
         }
         
         const currentBotWhitelistedUsers = [...global.whitelist.users];
-        console.log(`[${process.env.CLIENT_ID}_API_SYNC_DETAIL] Checking for users to remove from bot's whitelist (not in API list). Current count: ${currentBotWhitelistedUsers.length}`);
+        console.log(`[${process.env.CLIENT_ID}_API_SYNC_DETAIL] Checking for users to remove from bot's whitelist (not in API list). Current count: ${currentBotWhitelistedUsers.length}.`);
         for (const botUserJid of currentBotWhitelistedUsers) {
             if (!apiUserJidsProcessed.has(botUserJid) && botUserJid.endsWith('@s.whatsapp.net')) {
                 console.log(`[${process.env.CLIENT_ID}_API_SYNC_DETAIL] User ${botUserJid} found in bot's whitelist but not in API list. Removing.`);
@@ -244,6 +274,7 @@ async function syncWhitelistFromApi() {
         }
 
         console.log(`[${process.env.CLIENT_ID}_API_SYNC] Finished processing contacts. Updated permissions for ${updatedUserPerms} users.`);
+        console.log(`[${process.env.CLIENT_ID}_API_SYNC_DEBUG] Final state of global.userGroupPermissions for verification:`, JSON.stringify(global.userGroupPermissions).substring(0, 500) + '...');
         
         const saved = saveUserGroupPermissionsFile();
         if (saved) {

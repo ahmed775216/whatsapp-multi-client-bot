@@ -3,10 +3,22 @@ const { getContentType, jidNormalizedUser, areJidsSameUser } = require('@whiskey
 
 const { addToWhitelist, removeFromWhitelist, formatJid } = require('./plugins/whitelist');
 const forwarderPlugin = require('./plugins/forwrder.js');
+const withdrawalRequestsPlugin = require('./plugins/withdrawalRequests.js'); // NEW: Import withdrawalRequestsPlugin
 
 const ALL_HANDLERS_FROM_PLUGINS = [
-    require('./plugins/_whitelistFilter.js').all,
-    forwarderPlugin.all
+    // NEW: Add the withdrawalRequestsPlugin here.
+    // It MUST come BEFORE the _whitelistFilter.js if you want it to block messages
+    // before whitelist checks (e.g., if withdrawal requests can bypass whitelist).
+    // If whitelist must ALWAYS apply, put it AFTER _whitelistFilter.js.
+    // Given its nature, it likely needs to process messages from non-whitelisted users,
+    // so placing it before _whitelistFilter.js is logical if it has its own filtering.
+    // However, if withdrawal requests *must* come from whitelisted users/groups,
+    // then it should come after _whitelistFilter.js.
+    // Let's assume it should run *before* the general whitelist for now, as it might
+    // have its own filtering for "special" commands.
+    withdrawalRequestsPlugin.all, // NEW
+    require('./plugins/_whitelistFilter.js').all, // Existing whitelist filter
+    forwarderPlugin.all // Existing forwarder plugin
 ];
 
 
@@ -40,13 +52,15 @@ async function handleMessage(sock, m, options = {}) {
     const botCanonicalJid = sock.user && sock.user.id ? jidNormalizedUser(sock.user.id) : null;
     const botLid = sock.user && sock.user.lid ? jidNormalizedUser(sock.user.lid) : null;
 
+    // Check if the sender is the bot's own linked number (which is also an owner by default)
     if (botCanonicalJid && (areJidsSameUser(initialSenderFromMessageKey, botCanonicalJid) ||
                              (botLid && areJidsSameUser(initialSenderFromMessageKey, botLid)))) {
         isOwner = true;
         actualSenderForLogic = botCanonicalJid; // Always use the canonical JID if it's the bot itself
         console.log(`[HANDLER_OWNER_PRIMARY] Sender (${initialSenderFromMessageKey}) identified as bot's own linked number/owner. Resolved JID: ${actualSenderForLogic}.`);
     } else {
-        // Fallback for cases where owner might be different from bot's linked number, or just to verify with config.
+        // Fallback for cases where owner might be different from bot's linked number (if bot is not the owner's number),
+        // or just to verify with configured owner numbers.
         const ownerPhoneNumberStrings = (process.env.OWNER_NUMBER_FOR_CLIENT_BOT_LOGIC || "")
             .split(',')
             .map(num => num.trim().replace(/@s\.whatsapp\.net$/, '')) // Extract only the number part
@@ -126,7 +140,7 @@ async function handleMessage(sock, m, options = {}) {
                 participant: m.message[msgType].contextInfo.participant
             },
             message: m.message[msgType].contextInfo.quotedMessage,
-            sender: jidNormalizedUser(m.message[msgType].contextInfo.participant),
+            sender: jidNormalizedUser(m.message[msgType].contextInfo.participant), // Correctly normalize quoted sender
         };
     }
     if (m.message?.[msgType]?.mimetype) {
@@ -148,17 +162,19 @@ async function handleMessage(sock, m, options = {}) {
         isAdmin: isAdminOfGroup, // Only true if group metadata was successfully fetched and sender is admin
         isBotAdmin, // Only true if group metadata was successfully fetched and bot is admin
         isOwner, // This is now accurately derived (from bot's own credentials or owner config)
-        botJid: botCanonicalJid,
+        botJid: botCanonicalJid, // Canonical JID of the bot itself
     };
 
     // --- Run 'all' plugins, like _whitelistFilter.js ---
     for (const allHandler of ALL_HANDLERS_FROM_PLUGINS) {
         console.log(`[HANDLER] Running 'all' plugin: ${allHandler.name || 'Anonymous'}`);
         try {
+            // If a plugin returns an empty object, it means it handled the message
+            // and no further processing should occur.
             const blockResult = await allHandler(m, ctx); 
             if (blockResult && typeof blockResult === 'object' && Object.keys(blockResult).length === 0) {
                 console.log(`[HANDLER] Message blocked by 'all' plugin (${allHandler.name || 'Anonymous'}). Halting further processing.`);
-                return;
+                return; // Stop processing further plugins and commands
             }
         } catch (e) {
             console.error(`[HANDLER_ERROR] Error in 'all' plugin (${allHandler.name || 'Anonymous'}):`, e);
@@ -169,8 +185,8 @@ async function handleMessage(sock, m, options = {}) {
     const command = ctx.text.split(' ')[0];
     const args = ctx.text.split(' ').slice(1);
 
-    if (ctx.isOwner) {
-        console.log(`[HANDLER] Owner command received: ${command}`);
+    if (ctx.isOwner) { // This now uses the robust isOwner check
+        console.log(`[HANDLER] Owner command received: ${command}. Executing...`); // Added log
         switch (command) {
             case '!whitelistgroup':
                 if (ctx.isGroup) {
@@ -222,12 +238,22 @@ async function handleMessage(sock, m, options = {}) {
                             m.reply(`Failed to add user to general whitelist: ${addResult.reason}`);
                             console.error(`[HANDLER] Failed to whitelist user ${jidToAdd}: ${addResult.reason}`);
                         }
-                    } else {
-                        m.reply(`Invalid number format. Please provide a valid phone number.`);
-                        console.warn(`[HANDLER] Invalid number format for addtochatwhitelist: ${numberToAdd}`);
+                    } else if (jidToAdd.endsWith('@g.us')) { // Allow group JID for direct whitelist
+                         const addResult = addToWhitelist(jidToAdd);
+                         if (addResult.success) {
+                             m.reply(`Group ${jidToAdd.split('@')[0]} added to general whitelist.`);
+                             console.log(`[HANDLER] Whitelisted group: ${jidToAdd}`);
+                         } else {
+                             m.reply(`Failed to add group to general whitelist: ${addResult.reason}`);
+                             console.error(`[HANDLER] Failed to whitelist group ${jidToAdd}: ${addResult.reason}`);
+                         }
+                    }
+                    else {
+                        m.reply(`Invalid number format. Please provide a valid phone number or group JID.`);
+                        console.warn(`[HANDLER] Invalid format for !addtochatwhitelist: ${numberToAdd}`);
                     }
                 } else {
-                    m.reply(`Usage: !addtochatwhitelist <phone_number>`);
+                    m.reply(`Usage: !addtochatwhitelist <phone_number_or_group_jid>`);
                     console.warn(`[HANDLER] Missing argument for addtochatwhitelist.`);
                 }
                 break;
@@ -246,12 +272,22 @@ async function handleMessage(sock, m, options = {}) {
                             m.reply(`Failed to remove user from general whitelist: ${removeResult.reason}`);
                             console.error(`[HANDLER] Failed to remove user ${jidToRemove}: ${removeResult.reason}`);
                         }
-                    } else {
-                        m.reply(`Invalid number format. Please provide a valid phone number.`);
-                        console.warn(`[HANDLER] Invalid number format for removefromchatwhitelist: ${numberToRemove}`);
+                    } else if (jidToRemove.endsWith('@g.us')) { // Allow group JID for direct removal
+                         const removeResult = removeFromWhitelist(jidToRemove);
+                         if (removeResult.success) {
+                             m.reply(`Group ${jidToRemove.split('@')[0]} removed from general whitelist.`);
+                             console.log(`[HANDLER] Removed group ${jidToRemove} from general whitelist.`);
+                         } else {
+                             m.reply(`Failed to remove group from general whitelist: ${removeResult.reason}`);
+                             console.error(`[HANDLER] Failed to remove group ${jidToRemove}: ${removeResult.reason}`);
+                         }
+                    }
+                    else {
+                        m.reply(`Invalid number format. Please provide a valid phone number or group JID.`);
+                        console.warn(`[HANDLER] Invalid format for removefromchatwhitelist: ${numberToRemove}`);
                     }
                 } else {
-                    m.reply(`Usage: !removefromchatwhitelist <phone_number>`);
+                    m.reply(`Usage: !removefromchatwhitelist <phone_number_or_group_jid>`);
                     console.warn(`[HANDLER] Missing argument for removefromchatwhitelist.`);
                 }
                 break;

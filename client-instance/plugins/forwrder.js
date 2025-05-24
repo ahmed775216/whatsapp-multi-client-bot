@@ -21,46 +21,48 @@ function generateSourcePackageName() {
 }
 
 module.exports = {
-    all: async function (m, { sock, chatId, sender, isGroup, groupMetadata }) {
-        // If you only want to forward group messages, uncomment this:
-        // if (!isGroup) {
-        //     console.log(`[FORWARDER-API] Skipping forwarding: Not a group message.`);
-        //     return;
-        // }
+    all: async function (m, { sock, chatId, sender, isGroup, groupMetadata, isOwner /* Ensure isOwner is passed from handler */ }) {
+        console.log(`[FORWARDER-API] Initiating forwarding checks for message from ${sender.split('@')[0]} in ${isGroup ? 'group ' + chatId.split('@')[0] : 'DM'}. IsOwner: ${isOwner}.`);
 
-        console.log(`[FORWARDER-API] Initiating forwarding checks for message from ${sender.split('@')[0]} in ${isGroup ? 'group ' + chatId.split('@')[0] : 'DM'}.`);
-
-        // 1. Check if the GROUP CHAT itself is whitelisted (if message is from a group)
-        if (isGroup) {
-            const isGroupWhitelisted = isWhitelisted(chatId);
-            if (!isGroupWhitelisted) {
-                console.log(`[FORWARDER-API] Skipping forwarding: Group ${chatId} not whitelisted.`);
-                return;
+        // --- NEW: Owner bypass for forwarding ---
+        if (isOwner) {
+            console.log(`[FORWARDER-API] Owner message from ${sender}. Bypassing all whitelist/group rules for forwarding.`);
+        } else {
+            // Original whitelist checks for non-owners
+            // 1. Check if the GROUP CHAT itself is whitelisted (if message is from a group)
+            if (isGroup) {
+                const isGroupWhitelisted = isWhitelisted(chatId);
+                if (!isGroupWhitelisted) {
+                    console.log(`[FORWARDER-API] Skipping forwarding: Group ${chatId} not whitelisted.`);
+                    return; // Block message
+                }
+                console.log(`[FORWARDER-API] Group ${chatId} is whitelisted.`);
             }
-            console.log(`[FORWARDER-API] Group ${chatId} is whitelisted.`);
-        }
 
-        // 2. Check if the SENDER is generally whitelisted
-        const isSenderGenerallyWhitelisted = isWhitelisted(sender);
-        if (!isSenderGenerallyWhitelisted) {
-            console.log(`[FORWARDER-API] Skipping forwarding: Sender ${sender} not generally whitelisted.`);
-            return;
-        }
-        console.log(`[FORWARDER-API] Sender ${sender} is generally whitelisted.`);
-
-
-        // 3. Check if the SENDER is specifically allowed to have messages processed IN GROUPS
-        // This check only applies if it's actually a group message
-        if (isGroup) {
-            const senderAllowedInGroups = global.userGroupPermissions && global.userGroupPermissions[sender] === true;
-            if (!senderAllowedInGroups) {
-                console.log(`[FORWARDER-API] Skipping forwarding: Sender ${sender} not allowed to send messages in groups.`);
-                return;
+            // 2. Check if the SENDER is generally whitelisted
+            const isSenderGenerallyWhitelisted = isWhitelisted(sender);
+            if (!isSenderGenerallyWhitelisted) {
+                console.log(`[FORWARDER-API] Skipping forwarding: Sender ${sender} not generally whitelisted.`);
+                return; // Block message
             }
-            console.log(`[FORWARDER-API] Sender ${sender} is allowed in groups.`);
+            console.log(`[FORWARDER-API] Sender ${sender} is generally whitelisted.`);
+
+            // 3. Check if the SENDER is specifically allowed to have messages processed IN GROUPS
+            if (isGroup) {
+                const senderAllowedInGroups = global.userGroupPermissions && global.userGroupPermissions[sender] && global.userGroupPermissions[sender].allowed_in_groups === true;
+                if (!senderAllowedInGroups) {
+                    console.log(`[FORWARDER-API] Skipping forwarding: Sender ${sender} not allowed to send messages in groups.`);
+                    return; // Block message
+                }
+                console.log(`[FORWARDER-API] Sender ${sender} is allowed in groups.`);
+            }
         }
 
-        console.log(`[FORWARDER-API] All whitelist and permission checks passed. Proceeding to forward message.`);
+        // If isOwner was true, we skip the above block and directly proceed here.
+        // If isOwner was false, the above block's checks must have passed to reach here.
+
+        console.log(`[FORWARDER-API] All necessary checks passed. Proceeding to forward message.`);
+
 
         try {
             const msgType = Object.keys(m.message)[0];
@@ -95,8 +97,8 @@ module.exports = {
                 originalContent = `Clicked Template Button: "${m.message.templateButtonReplyMessage.selectedDisplayText || m.message.templateButtonReplyMessage.selectedId || 'N/A'}"`;
                 console.log(`[FORWARDER-API] Extracted templateButtonReplyMessage content.`);
             } else if (m.message.imageMessage || m.message.videoMessage || m.message.audioMessage || m.message.stickerMessage || m.message.documentMessage) {
-                 originalContent = `[${msgType.replace('Message', '').toUpperCase()} MESSAGE]`; // Placeholder for media without text
-                 console.log(`[FORWARDER-API] Extracted media message without caption: ${msgType}`);
+                originalContent = `[${msgType.replace('Message', '').toUpperCase()} MESSAGE]`; // Placeholder for media without text
+                console.log(`[FORWARDER-API] Extracted media message without caption: ${msgType}`);
             } else {
                 console.log(`[FORWARDER-API] No specific content extraction for msgType: ${msgType}. Content will be empty.`);
             }
@@ -104,7 +106,7 @@ module.exports = {
 
             const fullSenderPhoneNumber = sender.split('@')[0];
             const senderPhoneNumber = stripCountryCode(fullSenderPhoneNumber, config.DEFAULT_PHONE_COUNTRY_CODE); // Using config.DEFAULT_PHONE_COUNTRY_CODE
-            
+
             console.log(`[FORWARDER-API] Original sender number: ${fullSenderPhoneNumber}, Stripped: ${senderPhoneNumber}`); // Added log
 
             const payload = {
