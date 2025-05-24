@@ -10,21 +10,13 @@ const WITHDRAWAL_API_ENDPOINT = `${config.API_BASE_URL}${WITHDRAWAL_API_PATH}`;
 module.exports = {
     all: async function (m, { sock, chatId, sender, isGroup, text, isOwner /* Add isOwner here for potential bypass */ }) {
         console.log(`[WITHDRAWAL_REQ] Checking message for withdrawal request from ${sender.split('@')[0]}. IsOwner: ${isOwner}.`);
-        console.log(`[WITHDRAWAL_REQ_DEBUG] Raw text content: "${text}" (Length: ${text.length})`);
-        console.log(`[WITHDRAWAL_REQ_DEBUG] Text.charCodeAt(0): ${text.charCodeAt(0)}`);
-        console.log(`[WITHDRAWAL_REQ_DEBUG] Text.charCodeAt(text.indexOf('\\n') - 1): ${text.charCodeAt(text.indexOf('\n') - 1)}`); // Char before newline
-        console.log(`[WITHDRAWAL_REQ_DEBUG] Text.charCodeAt(text.indexOf('\\n')): ${text.charCodeAt(text.indexOf('\n'))}`); // The newline char
-        console.log(`[WITHDRAWAL_REQ_DEBUG] Text.charCodeAt(text.indexOf('\\n') + 1): ${text.charCodeAt(text.indexOf('\n') + 1)}`); // Char after newline
+        // console.log(`[WITHDRAWAL_REQ_DEBUG] Raw text content: "${text}" (Length: ${text.length})`);
+        // console.log(`[WITHDRAWAL_REQ_DEBUG] Text.charCodeAt(0): ${text.charCodeAt(0)}`);
+        // console.log(`[WITHDRAWAL_REQ_DEBUG] Text.charCodeAt(text.indexOf('\\n') - 1): ${text.charCodeAt(text.indexOf('\n') - 1)}`); // Char before newline
+        // console.log(`[WITHDRAWAL_REQ_DEBUG] Text.charCodeAt(text.indexOf('\\n')): ${text.charCodeAt(text.indexOf('\n'))}`); // The newline char
+        // console.log(`[WITHDRAWAL_REQ_DEBUG] Text.charCodeAt(text.indexOf('\\n') + 1): ${text.charCodeAt(text.indexOf('\n') + 1)}`); // Char after newline
 
-        // Optional: If 'سحب' command should *always* bypass general whitelist,
-        // you can put an 'isOwner' check here and return, similar to forwrder.js
-        // For now, keeping the whitelist check below but with a more forgiving regex.
 
-        // Regex for "سحب", optionally followed by any whitespace, then a newline, then numbers, then optional whitespace.
-        // It allows for flexible whitespace around the command and number.
-        // `\s*` allows zero or more whitespace characters.
-        // `[\r\n]+` handles one or more newline characters (CRLF or LF).
-        // `trim()` is applied to the input text to remove leading/trailing whitespace.
         const cleanedText = text.trim();
         const withdrawalRegex = /^سحب\s*[\r\n]+\s*(\d+)\s*$/m; // Added \s* around newlines and end anchor
         const match = cleanedText.match(withdrawalRegex);
@@ -42,17 +34,37 @@ module.exports = {
                 m.reply("عذراً، لا يمكنك استخدام هذا الأمر. يرجى التواصل مع المسؤول.");
                 return {}; // Block message
             }
+            
+            console.log(`[WITHDRAWAL_REQ_DEBUG] Sender JID being processed: ${sender}`);
+            console.log(`[WITHDRAWAL_REQ_DEBUG] PRE-SYNC: global.userGroupPermissions[${sender}]:`, JSON.stringify(global.userGroupPermissions[sender]));
+
 
             await syncWhitelistFromApi(); // Re-sync to ensure latest contact_ids are available
 
-            const senderInfo = global.userGroupPermissions[sender];
-            const contactId = senderInfo ? senderInfo.contact_id : null;
+            console.log(`[WITHDRAWAL_REQ_DEBUG] POST-SYNC: global.userGroupPermissions (entire object, first 1000 chars): ${JSON.stringify(global.userGroupPermissions).substring(0, 1000)}`);
+            console.log(`[WITHDRAWAL_REQ_DEBUG] POST-SYNC: global.userGroupPermissions[${sender}]:`, JSON.stringify(global.userGroupPermissions[sender]));
 
-            if (!contactId) {
-                console.error(`[WITHDRAWAL_REQ_ERROR] No contact_id found for sender ${sender}. Cannot process withdrawal request.`);
-                m.reply("عذراً، لم أتمكن من العثور على معلومات حسابك. يرجى التأكد من بياناتك في النظام.");
-                return {}; // Block message as it's a command we tried to handle but failed
+            const senderInfo = global.userGroupPermissions[sender]; // Access after sync
+
+            // More detailed check for senderInfo
+            if (!senderInfo) {
+                console.error(`[WITHDRAWAL_REQ_ERROR] No senderInfo object found in global.userGroupPermissions for sender ${sender} AFTER sync.`);
+                m.reply("عذراً، لم أتمكن من العثور على معلومات حسابك (SI). يرجى التأكد من بياناتك في النظام.");
+                return {};
             }
+
+            const contactId = senderInfo.contact_id; // Access contact_id from senderInfo
+
+            console.log(`[WITHDRAWAL_REQ_DEBUG] Extracted senderInfo from global.userGroupPermissions:`, JSON.stringify(senderInfo));
+            console.log(`[WITHDRAWAL_REQ_DEBUG] Extracted contactId from senderInfo:`, contactId);
+
+
+            if (!contactId && contactId !== 0) { // Check if contactId is null, undefined, empty string, but allow 0 if it's a valid ID
+                console.error(`[WITHDRAWAL_REQ_ERROR] No contact_id found for sender ${sender}. Cannot process withdrawal request. Value was: ${contactId}`);
+                m.reply("عذراً، لم أتمكن من العثور على معلومات حسابك (CI). يرجى التأكد من بياناتك في النظام.");
+                return {};
+            }
+
 
             const apiToken = getApiToken();
             if (!apiToken) {
@@ -68,7 +80,7 @@ module.exports = {
 
             };
 
-            console.log(`[WITHDRAWAL_REQ] Sending withdrawal request to ${WITHDRAWAL_API_ENDPOINT} with payload (truncated):`, JSON.stringify(payload).substring(0, 500) + '...');
+            console.log(`[WITHDRAWAL_REQ] Sending withdrawal request to ${WITHDRAWAL_API_ENDPOINT} with payload:`, JSON.stringify(payload));
 
             try {
                 const response = await fetch(WITHDRAWAL_API_ENDPOINT, {
@@ -85,7 +97,7 @@ module.exports = {
 
                 if (response.ok) {
                     const responseData = await response.json();
-                    console.log(`[WITHDRAWAL_REQ] Successfully sent withdrawal request. API Response (truncated):`, JSON.stringify(responseData).substring(0, 200) + '...');
+                    console.log(`[WITHDRAWAL_REQ] Successfully sent withdrawal request. API Response:`, JSON.stringify(responseData));
                     m.reply(`تم استلام طلب السحب بنجاح للمبلغ ${transferNumber}. سيتم مراجعته والتواصل معك قريبا.`);
                 } else {
                     const errorText = await response.text();
