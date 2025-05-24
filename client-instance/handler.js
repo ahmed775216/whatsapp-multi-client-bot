@@ -1,5 +1,5 @@
 // client-instance/handler.js
-const { getContentType, jidNormalizedUser, areJidsSameUser } = require('@whiskeysockets/baileys');
+const { getContentType, jidNormalizedUser, areJidsSameUser } = require('@whiskeysockets/baileys'); // Make sure areJidsSameUser is imported
 
 const { addToWhitelist, removeFromWhitelist, formatJid } = require('./plugins/whitelist');
 const forwarderPlugin = require('./plugins/forwrder.js');
@@ -13,27 +13,66 @@ const ALL_HANDLERS_FROM_PLUGINS = [
 
 async function handleMessage(sock, m, options = {}) {
     if (!m.message) {
-        console.log("[HANDLER] Message object is empty, skipping."); // Added log
+        console.log("[HANDLER] Message object is empty, skipping.");
         return;
     }
     const msgType = getContentType(m.message);
     if (!msgType) {
-        console.warn("[HANDLER] Could not determine message type, skipping."); // Added log
+        console.warn("[HANDLER] Could not determine message type, skipping.");
         return;
     }
 
     if (msgType === 'protocolMessage' || msgType === 'senderKeyDistributionMessage') {
-        console.log(`[HANDLER] Ignoring protocol/senderKeyDistribution message type: ${msgType}`); // Added log
+        console.log(`[HANDLER] Ignoring protocol/senderKeyDistribution message type: ${msgType}`);
         return;
     }
 
     const chatId = m.key.remoteJid;
-    const sender = jidNormalizedUser(m.key.participant || m.key.remoteJid);
+    // Initial senderId from message key (could be JID or LID)
+    const initialSenderId = jidNormalizedUser(m.key.participant || m.key.remoteJid);
     const isGroup = chatId.endsWith('@g.us');
 
+    let groupMetadata = {};
+    let participants = [];
+    let isAdmin = false;
+    let isBotAdmin = false;
+    let actualSenderJid = initialSenderId; // This will hold the resolved JID
+
+    if (isGroup) {
+        try {
+            groupMetadata = await sock.groupMetadata(chatId);
+            participants = groupMetadata.participants || [];
+
+            // --- VITAL CHANGE: Resolve actual JID of the sender ---
+            const senderParticipantInfo = participants.find(p => areJidsSameUser(p.id, initialSenderId));
+            if (senderParticipantInfo && senderParticipantInfo.id) {
+                actualSenderJid = jidNormalizedUser(senderParticipantInfo.id); // Use the ID from metadata
+                console.log(`[HANDLER_DETAIL] Sender ID resolution in group ${groupMetadata.subject}: Initial='${initialSenderId}', Resolved='${actualSenderJid}'`);
+            } else {
+                console.warn(`[HANDLER_WARN] Could not find participant info for '${initialSenderId}' in group '${groupMetadata.subject || chatId}'. Using initial ID.`);
+            }
+            // --- END VITAL CHANGE ---
+
+            const botJid = jidNormalizedUser(sock.user?.id);
+            const botParticipant = participants.find(p => areJidsSameUser(p.id, botJid));
+            isBotAdmin = !!(botParticipant && (botParticipant.admin === 'admin' || botParticipant.admin === 'superadmin'));
+
+            // Use actualSenderJid for isAdmin check as well
+            const senderAdminInfo = participants.find(p => areJidsSameUser(p.id, actualSenderJid));
+            isAdmin = !!(senderAdminInfo && (senderAdminInfo.admin === 'admin' || senderAdminInfo.admin === 'superadmin'));
+            
+        } catch (e) {
+            console.warn(`[HANDLER_ERROR] Could not fetch group metadata or participant info for ${chatId}:`, e.message);
+        }
+    }
+    // Else, for DMs, actualSenderJid remains initialSenderId (which is the user's JID)
+
     const ownerNumbers = (process.env.OWNER_NUMBER_FOR_CLIENT_BOT_LOGIC || "").split(',').map(num => num.trim());
-    const isOwner = ownerNumbers.includes(sender.split('@')[0]);
-    console.log(`[HANDLER] Processing message from ${sender.split('@')[0]} in ${isGroup ? 'group' : 'DM'} (Is Owner: ${isOwner}). Text: "${m.message?.conversation || m.message?.[msgType]?.text || m.message?.[msgType]?.caption || ''}"`); // Added verbose log
+    // --- Use actualSenderJid for isOwner check ---
+    const isOwner = ownerNumbers.includes(actualSenderJid.split('@')[0]);
+    // ---
+
+    console.log(`[HANDLER] Processing message from ${actualSenderJid.split('@')[0]} (Original sender ID from key: ${initialSenderId}) in ${isGroup ? 'group ' + (groupMetadata.subject || chatId.split('@')[0]) : 'DM'} (Is Owner: ${isOwner}). Text: "${m.message?.conversation || m.message?.[msgType]?.text || m.message?.[msgType]?.caption || ''}"`);
 
     m.reply = (text, targetChatId = m.key.remoteJid, replyOptions = {}) => sock.sendMessage(targetChatId, (typeof text === 'string') ? { text: text } : text, { quoted: m, ...replyOptions });
 
@@ -41,48 +80,28 @@ async function handleMessage(sock, m, options = {}) {
     m.mentionedJid = msgContextInfo?.mentionedJid || [];
 
     if (m.message?.[msgType]?.contextInfo?.quotedMessage) {
-        console.log("[HANDLER] Message is a reply."); // Added log
+        console.log("[HANDLER] Message is a reply.");
         m.quoted = {
             key: {
                 remoteJid: m.key.remoteJid,
                 id: m.message[msgType].contextInfo.stanzaId,
-                participant: m.message[msgType].contextInfo.participant
+                participant: m.message[msgType].contextInfo.participant // This could also be a LID
             },
             message: m.message[msgType].contextInfo.quotedMessage,
-            sender: m.message[msgType].contextInfo.participant,
+            // Resolve quoted sender's JID if needed, similar to main sender, for consistency
+            sender: jidNormalizedUser(m.message[msgType].contextInfo.participant),
         };
     }
     if (m.message?.[msgType]?.mimetype) {
-        console.log(`[HANDLER] Message contains media: ${msgType}`); // Added log
+        console.log(`[HANDLER] Message contains media: ${msgType}`);
          m.download = () => require('@whiskeysockets/baileys').downloadContentFromMessage(m.message[msgType], msgType.replace('Message', ''));
-    }
-
-    let groupMetadata = {};
-    let participants = [];
-    let isAdmin = false;
-    let isBotAdmin = false;
-
-    if (isGroup) {
-        try {
-            groupMetadata = await sock.groupMetadata(chatId);
-            participants = groupMetadata.participants || [];
-            const botJid = jidNormalizedUser(sock.user?.id);
-            const botParticipant = participants.find(p => p.id === botJid);
-            isBotAdmin = botParticipant && botParticipant.admin === 'admin';
-
-            const senderParticipant = participants.find(p => p.id === sender);
-            isAdmin = senderParticipant && senderParticipant.admin === 'admin';
-            console.log(`[HANDLER] Group Info: ${groupMetadata.subject}, Bot Admin: ${isBotAdmin}, Sender Admin: ${isAdmin}`); // Added log
-        } catch (e) {
-            console.warn(`[HANDLER] Could not fetch group metadata or participant info for ${chatId}:`, e.message);
-        }
     }
 
     const ctx = {
         sock,
         m,
         chatId,
-        sender,
+        sender: actualSenderJid, // Pass the resolved JID to plugins
         text: m.message?.conversation || m.message?.[msgType]?.text || m.message?.[msgType]?.caption || '',
         usedPrefix: '!',
         isGroup,
@@ -95,11 +114,11 @@ async function handleMessage(sock, m, options = {}) {
     };
 
     for (const allHandler of ALL_HANDLERS_FROM_PLUGINS) {
-        console.log(`[HANDLER] Running 'all' plugin: ${allHandler.name || 'Anonymous'}`); // Added log for plugin execution
+        console.log(`[HANDLER] Running 'all' plugin: ${allHandler.name || 'Anonymous'}`);
         try {
-            const blockResult = await allHandler(m, ctx);
+            const blockResult = await allHandler(m, ctx); // m still has original sender, ctx.sender has resolved one
             if (blockResult && typeof blockResult === 'object' && Object.keys(blockResult).length === 0) {
-                console.log(`[HANDLER] Message blocked by 'all' plugin (${allHandler.name || 'Anonymous'}). Halting further processing.`); // Added log
+                console.log(`[HANDLER] Message blocked by 'all' plugin (${allHandler.name || 'Anonymous'}). Halting further processing.`);
                 return;
             }
         } catch (e) {
@@ -110,8 +129,8 @@ async function handleMessage(sock, m, options = {}) {
     const command = ctx.text.split(' ')[0];
     const args = ctx.text.split(' ').slice(1);
 
-    if (ctx.isOwner) {
-        console.log(`[HANDLER] Owner command received: ${command}`); // Added log
+    if (ctx.isOwner) { // This now uses the correctly resolved owner status
+        console.log(`[HANDLER] Owner command received: ${command}`);
         switch (command) {
             case '!whitelistgroup':
                 if (ctx.isGroup) {
@@ -127,10 +146,11 @@ async function handleMessage(sock, m, options = {}) {
                     }
                 } else {
                     m.reply(`This command can only be used in a group.`);
-                    console.warn(`[HANDLER] Whitelistgroup command used outside a group by owner.`); // Added log
+                    console.warn(`[HANDLER] Whitelistgroup command used outside a group by owner.`);
                 }
                 break;
 
+            // ... (rest of your owner commands remain the same) ...
             case '!removegroup':
                 if (ctx.isGroup) {
                     const removeResult = removeFromWhitelist(ctx.chatId);
@@ -145,7 +165,7 @@ async function handleMessage(sock, m, options = {}) {
                     }
                 } else {
                     m.reply(`This command can only be used in a group.`);
-                    console.warn(`[HANDLER] Removegroup command used outside a group by owner.`); // Added log
+                    console.warn(`[HANDLER] Removegroup command used outside a group by owner.`);
                 }
                 break;
 
@@ -165,11 +185,11 @@ async function handleMessage(sock, m, options = {}) {
                         }
                     } else {
                         m.reply(`Invalid number format. Please provide a valid phone number.`);
-                        console.warn(`[HANDLER] Invalid number format for addtochatwhitelist: ${numberToAdd}`); // Added log
+                        console.warn(`[HANDLER] Invalid number format for addtochatwhitelist: ${numberToAdd}`);
                     }
                 } else {
                     m.reply(`Usage: !addtochatwhitelist <phone_number>`);
-                    console.warn(`[HANDLER] Missing argument for addtochatwhitelist.`); // Added log
+                    console.warn(`[HANDLER] Missing argument for addtochatwhitelist.`);
                 }
                 break;
             
@@ -189,19 +209,19 @@ async function handleMessage(sock, m, options = {}) {
                         }
                     } else {
                         m.reply(`Invalid number format. Please provide a valid phone number.`);
-                        console.warn(`[HANDLER] Invalid number format for removefromchatwhitelist: ${numberToRemove}`); // Added log
+                        console.warn(`[HANDLER] Invalid number format for removefromchatwhitelist: ${numberToRemove}`);
                     }
                 } else {
                     m.reply(`Usage: !removefromchatwhitelist <phone_number>`);
-                    console.warn(`[HANDLER] Missing argument for removefromchatwhitelist.`); // Added log
+                    console.warn(`[HANDLER] Missing argument for removefromchatwhitelist.`);
                 }
                 break;
             default:
-                console.log(`[HANDLER] Unknown owner command: ${command}. No action taken.`); // Added log
+                console.log(`[HANDLER] Unknown owner command: ${command}. No action taken.`);
                 break;
         }
     } else {
-        console.log(`[HANDLER] Non-owner message, not processing as command.`); // Added log
+        console.log(`[HANDLER] Non-owner message, not processing as command.`);
     }
 }
 
