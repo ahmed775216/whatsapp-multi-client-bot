@@ -544,7 +544,7 @@ function handleClientBotStatusUpdate(clientId, data) {
             // Don't call resetManagerLinkingDisplay immediately if it's an error,
             // let the UI decide if it wants to try again from that state.
             // if (status !== 'error') {
-            //     require('./qrWebSocketServer').resetManagerLinkingDisplay();
+            //     require('qrWebSocketServer').resetManagerLinkingDisplay();
             // }
             if (status === 'disconnected_logout' || status === 'linking_failed') {
                 // Ensure the temp process is stopped and removed if it fails to link
