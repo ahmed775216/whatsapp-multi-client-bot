@@ -10,11 +10,11 @@ const WITHDRAWAL_API_ENDPOINT = `${config.API_BASE_URL}${WITHDRAWAL_API_PATH}`;
 module.exports = {
     all: async function (m, { sock, chatId, sender, isGroup, text, isOwner /* Add isOwner here for potential bypass */ }) {
         console.log(`[WITHDRAWAL_REQ] Checking message for withdrawal request from ${sender.split('@')[0]}. IsOwner: ${isOwner}.`);
-        // console.log(`[WITHDRAWAL_REQ_DEBUG] Raw text content: "${text}" (Length: ${text.length})`);
-        // console.log(`[WITHDRAWAL_REQ_DEBUG] Text.charCodeAt(0): ${text.charCodeAt(0)}`);
-        // console.log(`[WITHDRAWAL_REQ_DEBUG] Text.charCodeAt(text.indexOf('\\n') - 1): ${text.charCodeAt(text.indexOf('\n') - 1)}`); // Char before newline
-        // console.log(`[WITHDRAWAL_REQ_DEBUG] Text.charCodeAt(text.indexOf('\\n')): ${text.charCodeAt(text.indexOf('\n'))}`); // The newline char
-        // console.log(`[WITHDRAWAL_REQ_DEBUG] Text.charCodeAt(text.indexOf('\\n') + 1): ${text.charCodeAt(text.indexOf('\n') + 1)}`); // Char after newline
+        console.log(`[WITHDRAWAL_REQ_DEBUG] Raw text content: "${text}" (Length: ${text.length})`);
+        console.log(`[WITHDRAWAL_REQ_DEBUG] Text.charCodeAt(0): ${text.charCodeAt(0)}`);
+        console.log(`[WITHDRAWAL_REQ_DEBUG] Text.charCodeAt(text.indexOf('\\n') - 1): ${text.charCodeAt(text.indexOf('\n') - 1)}`); // Char before newline
+        console.log(`[WITHDRAWAL_REQ_DEBUG] Text.charCodeAt(text.indexOf('\\n')): ${text.charCodeAt(text.indexOf('\n'))}`); // The newline char
+        console.log(`[WITHDRAWAL_REQ_DEBUG] Text.charCodeAt(text.indexOf('\\n') + 1): ${text.charCodeAt(text.indexOf('\n') + 1)}`); // Char after newline
 
 
         const cleanedText = text.trim();

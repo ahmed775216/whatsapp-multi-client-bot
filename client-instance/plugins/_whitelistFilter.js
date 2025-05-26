@@ -8,8 +8,9 @@ const { isWhitelisted } = require('./whitelist'); // Ensure correct path for thi
 module.exports = {
     all: async function (m, { sock, chatId, sender, isGroup, isOwner }) {
         if (isOwner) {
-            console.log(`[${process.env.CLIENT_ID}_FILTER] Owner ${sender.split('@')[0]} bypasses whitelist filter.`);
-            return;
+            console.log(`[${process.env.CLIENT_ID}_FILTER] Message from owner ${sender.split('@')[0]} in ${isGroup ? 'group ' + chatId.split('@')[0] : 'DM'} ALLOWED by owner filter.`);
+            return m; // Allow all messages from owner
+            
         }
 
         const isSenderGenerallyWhitelisted = isWhitelisted(sender);

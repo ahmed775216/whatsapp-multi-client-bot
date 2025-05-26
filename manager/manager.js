@@ -114,11 +114,11 @@ process.on('unhandledRejection', (reason, promise) => {
 
 process.on('SIGINT', () => {
     console.log("[MANAGER] SIGINT received, shutting down all instances...");
-    instanceManager.stopAllInstances(); // Implement this if needed
+    // instanceManager.stopAllInstances(); // Implement this if needed
     setTimeout(() => process.exit(0), 2000); // Give time for instances to shut down
 });
 process.on('SIGTERM', () => {
     console.log("[MANAGER] SIGTERM received, shutting down all instances...");
-    instanceManager.stopAllInstances(); // Implement this if needed
+    // instanceManager.stopAllInstances(); // Implement this if needed
     setTimeout(() => process.exit(0), 2000);
 });

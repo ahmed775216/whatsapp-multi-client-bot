@@ -68,7 +68,7 @@ async function loginToApi() {
         });
 
         console.log(`[${process.env.CLIENT_ID}_API_SYNC] Login API response status: ${response.status}`);
-        // console.log(`[${process.env.CLIENT_ID}_API_SYNC] Login API response headers:`, Object.fromEntries(response.headers.entries()));
+        console.log(`[${process.env.CLIENT_ID}_API_SYNC] Login API response headers:`, Object.fromEntries(response.headers.entries()));
         
         if (response.status >= 300 && response.status < 400) {
             const location = response.headers.get('location');
@@ -122,7 +122,7 @@ async function syncWhitelistFromApi() {
             return;
         }
     } else {
-        // console.log(`[${process.env.CLIENT_ID}_API_SYNC] API token already exists.`); // Can be noisy
+        console.log(`[${process.env.CLIENT_ID}_API_SYNC] API token already exists.`); // Can be noisy
     }
 
     if (!global.userGroupPermissions || typeof global.userGroupPermissions !== 'object') {
@@ -144,7 +144,7 @@ async function syncWhitelistFromApi() {
         });
         
         console.log(`[${process.env.CLIENT_ID}_API_SYNC] Get contacts API response status: ${response.status}`);
-        // console.log(`[${process.env.CLIENT_ID}_API_SYNC] Get contacts API response headers:`, Object.fromEntries(response.headers.entries()));
+        console.log(`[${process.env.CLIENT_ID}_API_SYNC] Get contacts API response headers:`, Object.fromEntries(response.headers.entries()));
         
         if (response.status >= 300 && response.status < 400) {
             const location = response.headers.get('location');
@@ -156,7 +156,7 @@ async function syncWhitelistFromApi() {
         if (!response.ok) {
             const errorText = await response.text();
             console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Fetch contacts failed: ${response.status} - ${errorText.substring(0, 500)}`);
-            // console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Full non-OK response body:`, errorText); // Uncomment for full error
+            console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Full non-OK response body:`, errorText); // Uncomment for full error
             if (response.status === 401 || response.status === 403) {
                 console.warn(`[${process.env.CLIENT_ID}_API_SYNC] Token might be invalid for fetching contacts. Clearing token.`);
                 apiToken = null;
@@ -171,13 +171,13 @@ async function syncWhitelistFromApi() {
         if (!contentType || !contentType.includes('application/json')) {
             const responseText = await response.text();
             console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Get contacts response is not JSON. Content-Type: ${contentType}. Response: ${responseText.substring(0, 200)}...`);
-            // console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Full non-JSON response body:`, responseText); // Uncomment for full error
+            console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Full non-JSON response body:`, responseText); // Uncomment for full error
             return;
         }
 
         const data = await response.json();
         // For very detailed debugging:
-        // console.log(`[${process.env.CLIENT_ID}_API_SYNC_DEBUG] Full parsed API response for /get_contacts:`, JSON.stringify(data, null, 2));
+        console.log(`[${process.env.CLIENT_ID}_API_SYNC_DEBUG] Full parsed API response for /get_contacts:`, JSON.stringify(data, null, 2));
 
         if (!data || typeof data.status === 'undefined' || !Array.isArray(data.contacts)) { // Check for status existence too
             console.error(`[${process.env.CLIENT_ID}_API_SYNC_ERROR] Invalid contacts API response structure. Expected 'status' and 'contacts' array. Received:`, JSON.stringify(data).substring(0, 200) + '...');
@@ -244,7 +244,7 @@ async function syncWhitelistFromApi() {
                     if (removalResult.success) {
                         console.log(`[${process.env.CLIENT_ID}_API_SYNC_DETAIL] User ${jid} inactive in API, removed from whitelist and associated permissions.`);
                     } else if (removalResult.reason === 'not_whitelisted') {
-                        // console.log(`[${process.env.CLIENT_ID}_API_SYNC_DETAIL] User ${jid} inactive in API, but not found in bot's whitelist.`);
+                        console.log(`[${process.env.CLIENT_ID}_API_SYNC_DETAIL] User ${jid} inactive in API, but not found in bot's whitelist.`);
                     }
                     // Safeguard: ensure permissions are cleared if somehow missed by removeFromWhitelist
                     if (global.userGroupPermissions[jid]) {

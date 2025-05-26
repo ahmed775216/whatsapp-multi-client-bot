@@ -87,9 +87,9 @@ function connectToManagerWebSocket() {
                     clientId: CLIENT_ID,
                 });
             } else if (parsedMsg.clientId === CLIENT_ID) {
-                // console.log(`[${CLIENT_ID}] Manager message (type: ${parsedMsg.type}): ${event.data.toString().substring(0,150)}`); // Can be noisy
+                console.log(`[${CLIENT_ID}] Manager message (type: ${parsedMsg.type}): ${event.data.toString().substring(0,150)}`); // Can be noisy
             } else if (parsedMsg.type !== 'internalCommand') { // General messages not for this client specifically
-                 // console.log(`[${CLIENT_ID}] Received general manager message: ${event.data.toString().substring(0,100)}`);
+                 console.log(`[${CLIENT_ID}] Received general manager message: ${event.data.toString().substring(0,100)}`);
             }
         } catch (error) {
             console.error(`[${CLIENT_ID}] Error processing manager message: ${error.message}. Raw: ${event.data.toString().substring(0,200)}`);
@@ -127,7 +127,7 @@ function reportStatusToManager(type, data = {}) {
             console.error(`[${CLIENT_ID}] Error sending status to manager: `, e.message);
         }
     } else {
-        // console.warn(`[${CLIENT_ID}] Manager WS not open, cannot report ${type}.`); // Can be noisy
+        console.warn(`[${CLIENT_ID}] Manager WS not open, cannot report ${type}.`); // Can be noisy
     }
 }
 
@@ -207,7 +207,7 @@ async function startClientBot() {
 
     sock.ev.on('messages.upsert', async (upsert) => {
         if (upsert.type !== 'notify') return;
-        // console.log(`[${CLIENT_ID}] Received ${upsert.messages.length} new messages.`); // Can be very noisy
+        console.log(`[${CLIENT_ID}] Received ${upsert.messages.length} new messages.`); // Can be very noisy
         for (const m of upsert.messages) {
             if (!m.key.fromMe) { // Process only incoming messages, not self-sent for commands
                  await handleMessage(sock, m, { clientId: CLIENT_ID });

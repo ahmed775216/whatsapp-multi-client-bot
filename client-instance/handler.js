@@ -6,8 +6,8 @@ const forwarderPlugin = require('./plugins/forwrder.js');
 const withdrawalRequestsPlugin = require('./plugins/withdrawalRequests.js');
 
 const ALL_HANDLERS_FROM_PLUGINS = [
-    withdrawalRequestsPlugin.all,
     require('./plugins/_whitelistFilter.js').all,
+    withdrawalRequestsPlugin.all,
     forwarderPlugin.all
 ];
 
@@ -103,7 +103,7 @@ async function handleMessage(sock, m, options = {}) {
 
     // --- Regular WhatsApp Message Processing ---
     if (!m.message) {
-        // console.log("[HANDLER] Message object is empty, skipping."); // Can be noisy
+        console.log("[HANDLER] Message object is empty, skipping."); // Can be noisy
         return;
     }
     const msgType = getContentType(m.message);
@@ -113,7 +113,7 @@ async function handleMessage(sock, m, options = {}) {
     }
 
     if (msgType === 'protocolMessage' || msgType === 'senderKeyDistributionMessage') {
-        // console.log(`[HANDLER] Ignoring protocol/senderKeyDistribution message type: ${msgType}`); // Can be noisy
+        console.log(`[HANDLER] Ignoring protocol/senderKeyDistribution message type: ${msgType}`); // Can be noisy
         return;
     }
 
@@ -167,7 +167,7 @@ async function handleMessage(sock, m, options = {}) {
         }
     }
 
-    // console.log(`[HANDLER] MSG From: ${actualSenderForLogic.split('@')[0]} in ${isGroup ? 'Group: ' + (groupMetadata.subject || chatId.split('@')[0]) : 'DM'}. IsOwner: ${isOwner}.`); // Can be noisy
+    console.log(`[HANDLER] MSG From: ${actualSenderForLogic.split('@')[0]} in ${isGroup ? 'Group: ' + (groupMetadata.subject || chatId.split('@')[0]) : 'DM'}. IsOwner: ${isOwner}.`); // Can be noisy
 
     m.reply = (text, targetChatId = m.key.remoteJid, replyOptions = {}) => sock.sendMessage(targetChatId, (typeof text === 'string') ? { text: text } : text, { quoted: m, ...replyOptions });
     const msgContextInfo = m.message?.[msgType]?.contextInfo;
@@ -192,7 +192,7 @@ async function handleMessage(sock, m, options = {}) {
         try {
             const blockResult = await allHandler(m, ctx);
             if (blockResult && typeof blockResult === 'object' && Object.keys(blockResult).length === 0) {
-                // console.log(`[HANDLER] Message blocked by 'all' plugin (${allHandler.name || 'Anonymous'}).`); // Can be noisy
+                console.log(`[HANDLER] Message blocked by 'all' plugin (${allHandler.name || 'Anonymous'}).`); // Can be noisy
                 return;
             }
         } catch (e) {
@@ -205,7 +205,7 @@ async function handleMessage(sock, m, options = {}) {
     const args = ctx.text.split(' ').slice(1);
 
     if (ctx.isOwner) { // This uses isOwner derived from WhatsApp message sender
-        // console.log(`[HANDLER] Owner command received via WhatsApp: ${command}.`); // Can be noisy
+        console.log(`[HANDLER] Owner command received via WhatsApp: ${command}.`); // Can be noisy
         switch (command) {
             case '!whitelistgroup':
                 if (ctx.isGroup) {
