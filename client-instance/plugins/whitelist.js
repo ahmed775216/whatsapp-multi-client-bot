@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const { jidNormalizedUser } = require('@whiskeysockets/baileys');
 
-const DATA_BASE_DIR = process.env.DATA_DIR_FOR_CLIENT; 
+const DATA_BASE_DIR = process.env.DATA_DIR;
 
 if (!DATA_BASE_DIR) {
     console.error("[WHITELIST_FATAL] DATA_DIR_FOR_CLIENT environment variable is not set. Whitelist will not function correctly.");

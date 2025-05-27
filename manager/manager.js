@@ -8,34 +8,46 @@ const qrWebSocketServer = require('./qrWebSocketServer');
 const instanceManager = require('./instanceManager');
 
 console.log('--- Starting WhatsApp Bot Manager ---');
-console.log(`[MANAGER_CONFIG] API_BASE_URL: ${config.API_BASE_URL}`);
-console.log(`[MANAGER_CONFIG] QR_WEBSOCKET_PORT: ${config.QR_WEBSOCKET_PORT}`);
 
 function handleQrRequest(apiUsername, apiPassword, ownerNumber) {
     const linkingClientId = instanceManager.generateClientId('new_linking_num');
-    console.log(`[MANAGER] UI requested QR. Launching temporary client: ${linkingClientId} with API User: ${apiUsername ? 'Provided' : 'None'}, Owner: ${ownerNumber ? 'Provided' : 'None'}`);
+    
+    console.log(`[MANAGER_DEBUG] handleQrRequest received:`);
+    console.log(`[MANAGER_DEBUG]   API Username: ${apiUsername ? apiUsername.substring(0,3) + '***' : 'NULL'}`);
+    console.log(`[MANAGER_DEBUG]   API Password: ${apiPassword ? '*** (Set)' : 'NULL'}`);
+    console.log(`[MANAGER_DEBUG]   Owner Number: ${ownerNumber ? ownerNumber.substring(0,3) + '***' : 'NULL'}`);
+
+    console.log(`[MANAGER] C# app requested QR. Launching temporary client: ${linkingClientId} with API user: ${apiUsername ? 'Provided' : 'None'}, Owner: ${ownerNumber ? 'Provided' : 'None'}`);
     
     qrWebSocketServer.updateManagerQrState(
         'linking_in_progress', 
         'Generating QR code for new WhatsApp link...', 
-        null, linkingClientId, null, null, true
+        null, 
+        linkingClientId, 
+        null, null, 
+        true
     );
+    
     instanceManager.launchClientInstance(linkingClientId, 'new_linking_num', true, apiUsername, apiPassword, ownerNumber);
 }
 
 const wsCallbacks = {
     onQrRequested: (apiUsername, apiPassword, ownerNumber) => handleQrRequest(apiUsername, apiPassword, ownerNumber),
     onManualRelink: (apiUsername, apiPassword, ownerNumber) => {
-        console.log('[MANAGER] UI requested manual re-link (logout/new QR).');
+        console.log('[MANAGER] C# app requested manual re-link (logout/new QR).');
+        console.log(`[MANAGER_DEBUG] onManualRelink received:`);
+        console.log(`[MANAGER_DEBUG]   API Username: ${apiUsername ? apiUsername.substring(0,3) + '***' : 'NULL'}`);
+        console.log(`[MANAGER_DEBUG]   API Password: ${apiPassword ? '*** (Set)' : 'NULL'}`);
+        console.log(`[MANAGER_DEBUG]   Owner Number: ${ownerNumber ? ownerNumber.substring(0,3) + '***' : 'NULL'}`);
         const currentUiLinkingClientId = qrWebSocketServer.managerQrState?.linkingClientId;
         if (currentUiLinkingClientId) {
             instanceManager.stopClientInstance(currentUiLinkingClientId);
-            console.log(`[MANAGER] Stopped existing temporary linking client: ${currentUiLinkingClientId} for manual relink.`);
+            console.log(`[MANAGER] Stopped existing temporary linking client: ${currentUiLinkingClientId}`);
         }
-        qrWebSocketServer.resetManagerLinkingDisplay(); // Clear old QR from UI
-        setTimeout(() => { // Give a moment for stop to process
+        qrWebSocketServer.resetManagerLinkingDisplay();
+        setTimeout(() => {
             handleQrRequest(apiUsername, apiPassword, ownerNumber);
-        }, 1500); // Increased delay
+        }, 1000);
     },
     onIncomingClientStatus: (clientId, data) => {
         instanceManager.handleClientBotStatusUpdate(clientId, data);
@@ -46,79 +58,70 @@ const wsCallbacks = {
     onListInstances: (ws) => {
         const instances = instanceManager.listInstances();
         qrWebSocketServer.sendToClient(ws, { type: 'instanceList', instances: instances });
+        console.log(`[MANAGER] Sent instance list to C# client.`);
     },
     onStartInstance: (clientId) => {
-        instanceManager.restartClientInstance(clientId); // Restart implies start if not running
+        // Find the instance to get its original launch parameters (username, password, owner)
+        const instance = instanceManager.ACTIVE_BOT_INSTANCES[clientId];
+        if (instance) {
+             console.log(`[MANAGER] Received request to start instance: ${clientId}. Launching with stored credentials.`);
+             // Pass stored credentials directly to launchClientInstance
+             instanceManager.launchClientInstance(
+                 clientId,
+                 instance.phoneNumber, // Use stored phone number
+                 false, // No force new scan on manual start
+                 instance.apiUsername,
+                 instance.apiPassword,
+                 instance.ownerNumber
+             );
+        } else {
+             console.warn(`[MANAGER] Attempted to start unknown or previously deleted client: ${clientId}. If folder exists, it will try to recover.`);
+             // If not in ACTIVE_BOT_INSTANCES, it might be a clean restart from persistent storage.
+             // Rely on `recoverExistingClientInstances` logic to pick up saved `client_config.json`.
+             // We can trigger `recoverExistingClientInstances` here, but it's heavier.
+             // Simpler: assume UI clicked start only on what is in list, or user knows best.
+             // Relaunching an already-tracked but 'stopped' process is handled in instanceManager.
+        }
     },
     onStopInstance: (clientId) => {
         instanceManager.stopClientInstance(clientId);
+        console.log(`[MANAGER] Received request to stop instance: ${clientId}`);
     },
     onRestartInstance: (clientId) => {
         instanceManager.restartClientInstance(clientId);
+        console.log(`[MANAGER] Received request to restart instance: ${clientId}`);
     },
-    onDeleteInstance: (clientId) => { // Handler for deleteInstance command
+    onDeleteInstance: (clientId) => { // NEW CALLBACK
         instanceManager.deleteClientInstance(clientId);
+        console.log(`[MANAGER] Received request to delete instance: ${clientId}`);
     },
     onGetLogs: (ws, clientId) => {
         const logs = instanceManager.getInstanceLogs(clientId);
         qrWebSocketServer.sendToClient(ws, { type: 'instanceLogs', clientId: clientId, logs: logs });
+        console.log(`[MANAGER] Sent logs for ${clientId} to C# client.`);
     },
-    // Callbacks for group/participant management
-    onFetchGroups: (clientId) => {
-        if (instanceManager.sendInternalCommandToClient(clientId, { command: 'fetchGroups' })) {
-            console.log(`[MANAGER] Sent 'fetchGroups' command to client ${clientId}.`);
-        } else { console.warn(`[MANAGER] Failed to send 'fetchGroups' to ${clientId} (not connected/found).`); }
+    onFetchGroups: (clientId) => { // NEW CALLBACK FOR FETCHING GROUPS
+        instanceManager.sendInternalCommandToClient(clientId, { command: 'fetchGroups' });
     },
-    onAddChatToWhitelist: (clientId, jidToWhitelist) => {
-        const payload = { command: 'addChatToWhitelist' };
-        if (jidToWhitelist.endsWith('@g.us')) payload.groupId = jidToWhitelist;
-        else payload.participantJid = jidToWhitelist;
-        
-        if (instanceManager.sendInternalCommandToClient(clientId, payload)) {
-            console.log(`[MANAGER] Sent 'addChatToWhitelist' for ${jidToWhitelist} to client ${clientId}.`);
-        } else { console.warn(`[MANAGER] Failed to send 'addChatToWhitelist' for ${jidToWhitelist} to ${clientId}.`); }
+    onAddChatToWhitelist: (clientId, groupId) => { // NEW CALLBACK FOR ADDING GROUP TO WHITELIST
+        instanceManager.sendInternalCommandToClient(clientId, { command: 'addChatToWhitelist', groupId: groupId });
     },
-    onRemoveFromChatWhitelist: (clientId, jidToRemove) => {
-        const payload = { command: 'removeFromChatWhitelist' };
-        if (jidToRemove.endsWith('@g.us')) payload.groupId = jidToRemove;
-        else payload.participantJid = jidToRemove;
-
-        if (instanceManager.sendInternalCommandToClient(clientId, payload)) {
-            console.log(`[MANAGER] Sent 'removeFromChatWhitelist' for ${jidToRemove} to client ${clientId}.`);
-        } else { console.warn(`[MANAGER] Failed to send 'removeFromChatWhitelist' for ${jidToRemove} to ${clientId}.`); }
-    },
-    onFetchParticipants: (clientId, groupId) => {
-        if (instanceManager.sendInternalCommandToClient(clientId, { command: 'fetchParticipants', groupId: groupId })) {
-            console.log(`[MANAGER] Sent 'fetchParticipants' for group ${groupId} to client ${clientId}.`);
-        } else { console.warn(`[MANAGER] Failed to send 'fetchParticipants' for group ${groupId} to ${clientId}.`); }
+    onFetchParticipants: (clientId, groupId) => { // NEW CALLBACK FOR FETCHING GROUP PARTICIPANTS
+        instanceManager.sendInternalCommandToClient(clientId, { command: 'fetchParticipants', groupId: groupId });
     }
 };
 
 qrWebSocketServer.startWebSocketServer(config.QR_WEBSOCKET_PORT, wsCallbacks);
 instanceManager.recoverExistingClientInstances();
 
-process.on('uncaughtException', (err, origin) => {
-    console.error(`[MANAGER_FATAL] Uncaught Exception at: ${origin}. Error: ${err.stack || err}`);
+process.on('uncaughtException', (err) => {
+    console.error('[MANAGER_FATAL] Uncaught Exception:', err);
     qrWebSocketServer.updateManagerQrState('error', `Manager internal error: ${err.message}`, null, null, null, null, false);
-    // Consider if process.exit(1) is too harsh or if it should try to stay alive for other instances.
-    // For now, keeping exit as it indicates a severe manager issue.
     process.exit(1);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
     console.error('[MANAGER_FATAL] Unhandled Rejection at:', promise, 'reason:', reason);
-    const message = (reason instanceof Error) ? reason.message : String(reason);
-    qrWebSocketServer.updateManagerQrState('error', `Manager unhandled rejection: ${message}`, null, null, null, null, false);
+    qrWebSocketServer.updateManagerQrState('error', `Manager unhandled rejection: ${reason.message || reason}`, null, null, null, null, false);
     process.exit(1);
-});
-
-process.on('SIGINT', () => {
-    console.log("[MANAGER] SIGINT received, shutting down all instances...");
-    // instanceManager.stopAllInstances(); // Implement this if needed
-    setTimeout(() => process.exit(0), 2000); // Give time for instances to shut down
-});
-process.on('SIGTERM', () => {
-    console.log("[MANAGER] SIGTERM received, shutting down all instances...");
-    // instanceManager.stopAllInstances(); // Implement this if needed
-    setTimeout(() => process.exit(0), 2000);
 });

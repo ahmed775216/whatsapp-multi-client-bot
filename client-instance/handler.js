@@ -15,14 +15,9 @@ async function handleMessage(sock, m, options = {}) {
     const isInternalCommand = options.isInternalCommand || false;
     const internalReply = options.internalReply || null;
     const clientIdForReply = options.clientId || null;
+    const lidToJidCache = options.lidToJidCache || new Map();
 
-    // For internal commands, authorization comes from the manager.
-    // The 'isOwner' for *internal* commands is less about the sender of a WhatsApp message
-    // and more about whether this bot instance *itself* is an owner, which might grant it special internal capabilities.
-    // However, for most internal commands like fetching data, this isn't strictly necessary.
-    // The `isBotOwnerForInternal` check was simplified/removed from this specific section
-    // as the commands primarily fetch data or modify a whitelist based on manager's instruction.
-
+    // --- Internal Command Processing ---
     if (isInternalCommand) {
         console.log(`[HANDLER_INTERNAL] Client ${clientIdForReply} received internal command: ${options.command} with payload:`, { groupId: options.groupId, participantJid: options.participantJid });
         try {
@@ -33,7 +28,7 @@ async function handleMessage(sock, m, options = {}) {
                         id: g.id,
                         subject: g.subject,
                         participantsCount: g.participants.length,
-                        isWhitelisted: isWhitelisted(g.id) // Check whitelist status for the group JID
+                        isWhitelisted: isWhitelisted(g.id)
                     }));
                     if (internalReply) internalReply({ type: 'groupsList', groups: formattedGroups, clientId: clientIdForReply });
                     console.log(`[HANDLER_INTERNAL] Client ${clientIdForReply} fetched ${formattedGroups.length} groups.`);
@@ -44,12 +39,12 @@ async function handleMessage(sock, m, options = {}) {
                     const jidToModify = options.groupId || options.participantJid;
                     if (!jidToModify) {
                         if (internalReply) internalReply({ type: 'error', message: 'JID (groupId or participantJid) is required for (un)whitelisting.', clientId: clientIdForReply });
-                        return; // Exit early
+                        return;
                     }
 
                     let modResult;
                     let itemType = jidToModify.endsWith('@g.us') ? 'group' : 'user';
-                    let actionType = ''; // For the reply type
+                    let actionType = '';
 
                     if (options.command === 'addChatToWhitelist') {
                         modResult = addToWhitelist(jidToModify);
@@ -75,19 +70,28 @@ async function handleMessage(sock, m, options = {}) {
                     const groupJidForParticipants = options.groupId;
                     if (!groupJidForParticipants) {
                         if (internalReply) internalReply({ type: 'error', message: 'Group ID is required for fetching participants.', clientId: clientIdForReply });
-                        return; // Exit early
+                        return;
                     }
-                    const groupMeta = await sock.groupMetadata(groupJidForParticipants);
-                    const participants = groupMeta.participants.map(p => {
+                    const groupMetaForParticipants = await sock.groupMetadata(groupJidForParticipants);
+                    const participantsData = groupMetaForParticipants.participants.map(p => {
                         const participantJid = jidNormalizedUser(p.id);
+                        // محاولة الحصول على الاسم من خصائص المشارك المتوفرة
+                        let displayName = p.name || p.notify || p.pushname || p.verifiedName || ''; 
+
+                        // إذا لم يكن هناك اسم، استخدم الجزء الأول من JID/LID كاسم افتراضي
+                        if (!displayName) {
+                            displayName = participantJid.split('@')[0];
+                        }
+
                         return {
                             jid: participantJid,
+                            displayName: displayName,
                             isAdmin: (p.admin === 'admin' || p.admin === 'superadmin'),
-                            isWhitelisted: isWhitelisted(participantJid) // Check whitelist status for the participant JID
+                            isWhitelisted: isWhitelisted(participantJid) || (lidToJidCache.has(participantJid) && isWhitelisted(lidToJidCache.get(participantJid)))
                         };
                     });
-                    if (internalReply) internalReply({ type: 'participantsList', participants: participants, groupId: groupJidForParticipants, clientId: clientIdForReply });
-                    console.log(`[HANDLER_INTERNAL] Client ${clientIdForReply} fetched ${participants.length} participants for group ${groupJidForParticipants}.`);
+                    if (internalReply) internalReply({ type: 'participantsList', participants: participantsData, groupId: groupJidForParticipants, clientId: clientIdForReply });
+                    console.log(`[HANDLER_INTERNAL] Client ${clientIdForReply} fetched ${participantsData.length} participants for group ${groupJidForParticipants}.`);
                     break;
 
                 default:
@@ -98,12 +102,11 @@ async function handleMessage(sock, m, options = {}) {
             console.error(`[HANDLER_INTERNAL_ERROR] Client ${clientIdForReply} error processing internal command ${options.command}:`, e.message, e.stack);
             if (internalReply) internalReply({ type: 'error', message: `Error processing command ${options.command}: ${e.message}`, clientId: clientIdForReply });
         }
-        return; // Internal commands processed, stop further execution for this "message"
+        return; // Internal commands processed, stop further execution
     }
 
     // --- Regular WhatsApp Message Processing ---
     if (!m.message) {
-        console.log("[HANDLER] Message object is empty, skipping."); // Can be noisy
         return;
     }
     const msgType = getContentType(m.message);
@@ -113,7 +116,6 @@ async function handleMessage(sock, m, options = {}) {
     }
 
     if (msgType === 'protocolMessage' || msgType === 'senderKeyDistributionMessage') {
-        console.log(`[HANDLER] Ignoring protocol/senderKeyDistribution message type: ${msgType}`); // Can be noisy
         return;
     }
 
@@ -121,25 +123,44 @@ async function handleMessage(sock, m, options = {}) {
     const initialSenderFromMessageKey = jidNormalizedUser(m.key.participant || m.key.remoteJid);
     const isGroup = chatId.endsWith('@g.us');
     let actualSenderForLogic = initialSenderFromMessageKey;
-    let isOwner = false; // This is for the WhatsApp message sender
+    let isOwner = false;
+
+    if (actualSenderForLogic.endsWith('@lid')) {
+        console.log(`[HANDLER_LID] Initial sender is LID: ${actualSenderForLogic}. Attempting to resolve JID.`);
+        const cachedJid = lidToJidCache.get(actualSenderForLogic);
+        if (cachedJid) {
+            actualSenderForLogic = cachedJid;
+            console.log(`[HANDLER_LID] Resolved ${initialSenderFromMessageKey} to JID ${actualSenderForLogic} from cache.`);
+        } else {
+            console.log(`[HANDLER_LID] LID ${actualSenderForLogic} not in cache. Attempting direct fetch.`);
+            try {
+                const contactInfoArray = await sock.getContacts([actualSenderForLogic]);
+                if (contactInfoArray && contactInfoArray.length > 0) {
+                    const contactInfo = contactInfoArray[0];
+                    if (contactInfo.id && contactInfo.id.endsWith('@s.whatsapp.net')) {
+                        actualSenderForLogic = jidNormalizedUser(contactInfo.id);
+                        lidToJidCache.set(initialSenderFromMessageKey, actualSenderForLogic);
+                        console.log(`[HANDLER_LID] Resolved ${initialSenderFromMessageKey} to JID ${actualSenderForLogic} via direct fetch and cached.`);
+                    } else {
+                        console.warn(`[HANDLER_LID] Direct fetch for ${initialSenderFromMessageKey} did not return a valid JID. Contact info:`, contactInfo);
+                    }
+                } else {
+                    console.warn(`[HANDLER_LID] Could not resolve LID ${initialSenderFromMessageKey} to JID via direct fetch (no contact info returned).`);
+                }
+            } catch (fetchErr) {
+                console.error(`[HANDLER_LID_ERROR] Error fetching contact info for LID ${initialSenderFromMessageKey}:`, fetchErr.message);
+            }
+        }
+    }
 
     const botCanonicalJid = sock.user && sock.user.id ? jidNormalizedUser(sock.user.id) : null;
-    const botLid = sock.user && sock.user.lid ? jidNormalizedUser(sock.user.lid) : null;
+    const botLid = sock.user && sock.user.lid && sock.user.lid.user ? jidNormalizedUser(`${sock.user.lid.user}@${sock.user.lid.server || 'lid'}`) : null;
 
-    if (botCanonicalJid && (areJidsSameUser(initialSenderFromMessageKey, botCanonicalJid) || (botLid && areJidsSameUser(initialSenderFromMessageKey, botLid)))) {
+
+    if (botCanonicalJid && (areJidsSameUser(actualSenderForLogic, botCanonicalJid) || (botLid && areJidsSameUser(actualSenderForLogic, botLid)))) {
         isOwner = true;
-        actualSenderForLogic = botCanonicalJid;
-    } else {
-        const ownerPhoneNumberStrings = (process.env.OWNER_NUMBER_FOR_CLIENT_BOT_LOGIC || "").split(',').map(num => num.trim().replace(/@s\.whatsapp\.net$/, '')).filter(num => num);
-        for (const ownerPhone of ownerPhoneNumberStrings) {
-            if (ownerPhone) {
-                const configuredOwnerJid = formatJid(ownerPhone); // formatJid will add @s.whatsapp.net
-                if (areJidsSameUser(initialSenderFromMessageKey, configuredOwnerJid)) {
-                    isOwner = true;
-                    actualSenderForLogic = configuredOwnerJid;
-                    break;
-                }
-            }
+        if (actualSenderForLogic.endsWith('@lid') && botCanonicalJid) {
+            actualSenderForLogic = botCanonicalJid;
         }
     }
 
@@ -152,28 +173,56 @@ async function handleMessage(sock, m, options = {}) {
         try {
             groupMetadata = await sock.groupMetadata(chatId);
             participants = groupMetadata.participants || [];
+
             if (actualSenderForLogic.endsWith('@lid') && !isOwner) {
-                const senderParticipantInfo = participants.find(p => p && p.id && areJidsSameUser(p.id, initialSenderFromMessageKey));
-                if (senderParticipantInfo && senderParticipantInfo.id) {
+                const senderParticipantInfo = participants.find(p => p && p.id && (areJidsSameUser(p.id, initialSenderFromMessageKey) || (p.lid && p.lid.user && areJidsSameUser(jidNormalizedUser(`${p.lid.user}@${p.lid.server || 'lid'}`), initialSenderFromMessageKey))));
+                if (senderParticipantInfo && senderParticipantInfo.id.endsWith('@s.whatsapp.net')) {
                     actualSenderForLogic = jidNormalizedUser(senderParticipantInfo.id);
+                    console.log(`[HANDLER_LID] Resolved ${initialSenderFromMessageKey} to JID ${actualSenderForLogic} from groupMetadata.`);
+                    if (!lidToJidCache.has(initialSenderFromMessageKey)) {
+                        lidToJidCache.set(initialSenderFromMessageKey, actualSenderForLogic);
+                    }
+                } else {
+                    console.log(`[HANDLER_LID] Still could not resolve LID ${initialSenderFromMessageKey} from groupMetadata.`);
                 }
             }
-            const botParticipant = participants.find(p => p && p.id && areJidsSameUser(p.id, botCanonicalJid));
+
+            const botParticipant = participants.find(p => p && p.id && botCanonicalJid && areJidsSameUser(p.id, botCanonicalJid));
             isBotAdmin = !!(botParticipant && (botParticipant.admin === 'admin' || botParticipant.admin === 'superadmin'));
+            
             const senderAdminInfo = participants.find(p => p && p.id && areJidsSameUser(p.id, actualSenderForLogic));
             isAdminOfGroup = !!(senderAdminInfo && (senderAdminInfo.admin === 'admin' || senderAdminInfo.admin === 'superadmin'));
         } catch (e) {
             console.error(`[HANDLER_ERROR] Could not fetch group metadata for ${chatId}: ${e.message}.`);
         }
     }
+    
+    if (!isOwner) {
+        const ownerPhoneNumberStrings = (process.env.OWNER_NUMBER_FOR_CLIENT_BOT_LOGIC || "").split(',').map(num => num.trim().replace(/@s\.whatsapp\.net$/, '')).filter(num => num);
+        for (const ownerPhone of ownerPhoneNumberStrings) {
+            if (ownerPhone) {
+                const configuredOwnerJid = formatJid(ownerPhone);
+                if (areJidsSameUser(actualSenderForLogic, configuredOwnerJid)) {
+                    isOwner = true;
+                    break;
+                }
+            }
+        }
+    }
 
-    console.log(`[HANDLER] MSG From: ${actualSenderForLogic.split('@')[0]} in ${isGroup ? 'Group: ' + (groupMetadata.subject || chatId.split('@')[0]) : 'DM'}. IsOwner: ${isOwner}.`); // Can be noisy
+    console.log(`[HANDLER] MSG From: ${actualSenderForLogic.split('@')[0]} (Original: ${initialSenderFromMessageKey.split('@')[0]}) in ${isGroup ? 'Group: ' + (groupMetadata.subject || chatId.split('@')[0]) : 'DM'}. IsOwner: ${isOwner}.`);
 
     m.reply = (text, targetChatId = m.key.remoteJid, replyOptions = {}) => sock.sendMessage(targetChatId, (typeof text === 'string') ? { text: text } : text, { quoted: m, ...replyOptions });
     const msgContextInfo = m.message?.[msgType]?.contextInfo;
     m.mentionedJid = msgContextInfo?.mentionedJid || [];
     if (m.message?.[msgType]?.contextInfo?.quotedMessage) {
-        m.quoted = { /* ... quoted message setup ... */ };
+        m.quoted = {
+             key: msgContextInfo.stanzaId,
+             id: msgContextInfo.stanzaId,
+             sender: jidNormalizedUser(msgContextInfo.participant || chatId),
+             message: msgContextInfo.quotedMessage,
+             text: msgContextInfo.quotedMessage?.conversation || msgContextInfo.quotedMessage?.[getContentType(msgContextInfo.quotedMessage)]?.text || msgContextInfo.quotedMessage?.[getContentType(msgContextInfo.quotedMessage)]?.caption || '',
+        };
     }
     if (m.message?.[msgType]?.mimetype) {
         m.download = () => require('@whiskeysockets/baileys').downloadContentFromMessage(m.message[msgType], msgType.replace('Message', ''));
@@ -190,9 +239,8 @@ async function handleMessage(sock, m, options = {}) {
 
     for (const allHandler of ALL_HANDLERS_FROM_PLUGINS) {
         try {
-            const blockResult = await allHandler(m, ctx);
+            const blockResult = await allHandler(m, { ...ctx, lidToJidCache });
             if (blockResult && typeof blockResult === 'object' && Object.keys(blockResult).length === 0) {
-                console.log(`[HANDLER] Message blocked by 'all' plugin (${allHandler.name || 'Anonymous'}).`); // Can be noisy
                 return;
             }
         } catch (e) {
@@ -200,12 +248,10 @@ async function handleMessage(sock, m, options = {}) {
         }
     }
 
-    // --- Owner Commands for WhatsApp messages ---
     const command = ctx.text.split(' ')[0];
     const args = ctx.text.split(' ').slice(1);
 
-    if (ctx.isOwner) { // This uses isOwner derived from WhatsApp message sender
-        console.log(`[HANDLER] Owner command received via WhatsApp: ${command}.`); // Can be noisy
+    if (ctx.isOwner) {
         switch (command) {
             case '!whitelistgroup':
                 if (ctx.isGroup) {
@@ -219,7 +265,7 @@ async function handleMessage(sock, m, options = {}) {
                     m.reply(removeResult.success ? `Group ${ctx.groupMetadata.subject || ctx.chatId} removed from whitelist.` : `Failed: ${removeResult.reason}`);
                 } else { m.reply(`This command can only be used in a group.`); }
                 break;
-            case '!addtochatwhitelist': // For adding users or groups via owner's WhatsApp
+            case '!addtochatwhitelist':
                 if (args.length > 0) {
                     const jidToAdd = formatJid(args[0]);
                     if (jidToAdd) {
@@ -237,7 +283,6 @@ async function handleMessage(sock, m, options = {}) {
                     } else { m.reply(`Invalid JID format: ${args[0]}`); }
                 } else { m.reply(`Usage: !removefromchatwhitelist <phone_number_or_group_jid>`); }
                 break;
-            // default: console.log(`[HANDLER] Unknown owner command via WhatsApp: ${command}.`); // Can be noisy
         }
     }
 }

@@ -29,13 +29,6 @@ function generateClientId(phoneNumber) {
 function getClientDataPath(clientId) {
     return path.join(config.CLIENT_DATA_BASE_DIR, clientId);
 }
-// function stopAllInstances(){
-//     console.log("[INST_MGR] Stopping all active client instances...");
-//     for (const clientId in ACTIVE_BOT_INSTANCES) {
-//         stopClientInstance(clientId);
-//     }
-//     console.log("[INST_MGR] All active client instances have been stopped.");
-// }
 
 /**
  * Launches a new bot instance as a child process.
@@ -541,7 +534,6 @@ function handleClientBotStatusUpdate(clientId, data) {
                 }
 
                 updateManagerQrState('connected', `WhatsApp Linked: ${name} (${phoneNumber})!`, null, newPermanentClientId, phoneNumber, name, false);
-                require('./qrWebSocketServer').resetManagerLinkingDisplay();
             }
         } else {
             console.log(`[INST_MGR] Existing client ${clientId} (${phoneNumber || instance?.phoneNumber || 'unknown'}) reported status: ${status}. Message: ${message}`);
@@ -552,7 +544,7 @@ function handleClientBotStatusUpdate(clientId, data) {
             // Don't call resetManagerLinkingDisplay immediately if it's an error,
             // let the UI decide if it wants to try again from that state.
             // if (status !== 'error') {
-            //     require('qrWebSocketServer').resetManagerLinkingDisplay();
+            //     require('./qrWebSocketServer').resetManagerLinkingDisplay();
             // }
             if (status === 'disconnected_logout' || status === 'linking_failed') {
                 // Ensure the temp process is stopped and removed if it fails to link
@@ -646,5 +638,4 @@ module.exports = {
     getInstanceLogs,
     ACTIVE_BOT_INSTANCES, // Export for manager.js callbacks
     sendInternalCommandToClient, // EXPORTED NEW FUNCTION
-    // stopAllInstances, 
 };
