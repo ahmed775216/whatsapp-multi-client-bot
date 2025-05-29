@@ -41,7 +41,7 @@ module.exports = {
                 const isChatWhitelisted = isWhitelisted(chatId); // تحقق مما إذا كانت المجموعة نفسها في القائمة البيضاء
                  if (!isChatWhitelisted) {
                     console.log(`[${process.env.CLIENT_ID}_FILTER] Group ${chatId.split('@')[0]} not whitelisted. Blocking message from ${sender.split('@')[0]} (Name: ${pushName}).`);
-                    try { await sock.sendMessage(m.key.remoteJid, { react: { text: '🚫', key: m.key } }); } catch (e) { /* تجاهل أخطاء الرد */ }
+                    // try { await sock.sendMessage(m.key.remoteJid, { react: { text: '🚫', key: m.key } }); } catch (e) { /* تجاهل أخطاء الرد */ }
                     return {}; // Block message
                 }
 
@@ -49,7 +49,7 @@ module.exports = {
                 const senderAllowedInGroups = global.userGroupPermissions && global.userGroupPermissions[sender] && global.userGroupPermissions[sender].allowed_in_groups === true;
                 if (!senderAllowedInGroups) {
                     console.log(`[${process.env.CLIENT_ID}_FILTER] Sender ${sender.split('@')[0]} (Name: ${pushName}) is whitelisted but NOT allowed in groups. Blocking message in group ${chatId.split('@')[0]}.`);
-                    try { await sock.sendMessage(m.key.remoteJid, { react: { text: ' Restricted Access 🚫', key: m.key } }); } catch (e) { /* تجاهل أخطاء الرد */ }
+                    // try { await sock.sendMessage(m.key.remoteJid, { react: { text: ' Restricted Access 🚫', key: m.key } }); } catch (e) { /* تجاهل أخطاء الرد */ }
                     return {}; // Block message
                 }
             }
@@ -69,9 +69,9 @@ module.exports = {
 
             console.log(`[${process.env.CLIENT_ID}_FILTER] Unresolved @lid ${originalMessageSenderJid} (Name: ${pushName}) is not whitelisted. Requesting identification.`);
             try {
-                const sentMsg = await sock.sendMessage(m.key.remoteJid, {
-                    text: `مرحبًا ${pushName || ''}! لم نتمكن من التحقق من هويتك تلقائيًا. للوصول إلى خدمات البوت، يرجى إرسال رقم هاتفك الكامل المسجل لدينا (مع مفتاح الدولة، مثال: +967xxxxxxxxx).`
-                });
+                // const sentMsg = await sock.sendMessage(m.key.remoteJid, {
+                //     text: `مرحبًا ${pushName || ''}! لم نتمكن من التحقق من هويتك تلقائيًا. للوصول إلى خدمات البوت، يرجى إرسال رقم هاتفك الكامل المسجل لدينا (مع مفتاح الدولة، مثال: +967xxxxxxxxx).`
+                // });
                 askedLidsMap.set(originalMessageSenderJid, Date.now());
                 saveAskedLidsFile(); // حفظ تحديث الكاش
                 
@@ -93,7 +93,7 @@ module.exports = {
                 await m.reply(`عذراً ${pushName || ''}! لا يمكنك استخدام هذا البوت. يرجى التواصل مع المسؤول إذا كنت تعتقد أن هذا خطأ.`);
             } catch (e) { console.error(`[${process.env.CLIENT_ID}_FILTER_ERROR] Failed to send DM rejection to non-whitelisted user ${sender.split('@')[0]}: ${e.message}`); }
         } else { // في المجموعات، يمكن وضع رد فعل فقط
-             try { await sock.sendMessage(m.key.remoteJid, { react: { text: '🚫', key: m.key } }); } catch (e) { /* تجاهل أخطاء الرد */ }
+            //  try { await sock.sendMessage(m.key.remoteJid, { react: { text: '🚫', key: m.key } }); } catch (e) { /* تجاهل أخطاء الرد */ }
         }
         return {}; // Block message
     }

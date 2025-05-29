@@ -192,7 +192,9 @@ async function handleMessage(sock, m, options = {}) {
     m.reply = (text, targetChatId = m.key.remoteJid, replyOptions = {}) => sock.sendMessage(targetChatId, (typeof text === 'string') ? { text: text } : text, { quoted: m, ...replyOptions });
     const msgContextInfo = m.message?.[msgType]?.contextInfo;
     m.mentionedJid = msgContextInfo?.mentionedJid || [];
-    if (m.message?.[msgType]?.contextInfo?.quotedMessage) { m.quoted = { /* ... */ }; }
+    if (m.message?.[msgType]?.contextInfo?.quotedMessage) { m.quoted = {
+        
+    }; }
     if (m.message?.[msgType]?.mimetype) { m.download = () => require('@whiskeysockets/baileys').downloadContentFromMessage(m.message[msgType], msgType.replace('Message', '')); }
     
     const textContent = m.message?.conversation || m.message?.[msgType]?.text || m.message?.[msgType]?.caption || '';

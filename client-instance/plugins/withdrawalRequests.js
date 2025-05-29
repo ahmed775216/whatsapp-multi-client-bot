@@ -196,9 +196,9 @@ async function pollForOtpReadyOrNotTransfer(request, requestKey, sock) { // اس
             request.transferDetails = item.transfer_details;
             request.apiTransferId = item.id; // تحديث إذا لزم الأمر
             const userMessage = `تفاصيل الحوالة:\n${item.transfer_details}\n\nرمز التأكيد (OTP) الخاص بك هو:\n\`\`\`${item.confirmation_code}\`\`\`\n\nالرجاء إعادة إرسال رمز التأكيد فقط لتأكيد عملية السحب.`;
-            await sock.sendMessage(request.senderJid, { text: userMessage }); // استخدام sock.sendMessage
+            // await sock.sendMessage(request.senderJid, { text: userMessage }); // استخدام sock.sendMessage
         } else if (item.Note) {
-            await sock.sendMessage(request.senderJid, { text: item.Note }); // استخدام sock.sendMessage
+            // await sock.sendMessage(request.senderJid, { text: item.Note }); // استخدام sock.sendMessage
             delete pendingWithdrawals[requestKey];
         } else if (item.status === 1 && !item.confirmation_code && !item.customer_confirmed) {
             request.status = "awaiting_not_transfer_note";
@@ -216,7 +216,7 @@ async function pollForNotTransferNote(request, requestKey, sock) { // استقب
         const response = await fetchWithToken(`${NOT_TRANSFERS_API_ENDPOINT}?id=${request.apiTransferId}`);
         if (!response.ok) {
             if (response.status === 404) {
-                await sock.sendMessage(request.senderJid, { text: `تعذر العثور على تفاصيل الطلب ${request.originalTransferNumber} (NT404).`});
+                // await sock.sendMessage(request.senderJid, { text: `تعذر العثور على تفاصيل الطلب ${request.originalTransferNumber} (NT404).`});
                 delete pendingWithdrawals[requestKey];
             }
             return;
@@ -225,7 +225,7 @@ async function pollForNotTransferNote(request, requestKey, sock) { // استقب
         const item = Array.isArray(responseData.data) ? responseData.data.find(d => d.id && d.id.toString() === request.apiTransferId.toString()) : 
                      (responseData.id && responseData.id.toString() === request.apiTransferId.toString() ? responseData : null);
         if (item && item.Note) {
-            await sock.sendMessage(request.senderJid, { text: item.Note }); // استخدام sock.sendMessage
+            // await sock.sendMessage(request.senderJid, { text: item.Note }); // استخدام sock.sendMessage
             delete pendingWithdrawals[requestKey];
         } else { /* ... */ }
     } catch (error) { console.error(`[POLL_NOT_TRANSFER] Error for ${requestKey}:`, error); }
@@ -238,7 +238,7 @@ async function pollForPostOtpNote(request, requestKey, sock) { // استقبال
         const response = await fetchWithToken(`${CONFIRM_WITHDRAWAL_API_ENDPOINT_BASE}/${request.apiTransferId}`);
         if (!response.ok) {
             if (response.status === 404) {
-                 await sock.sendMessage(request.senderJid, { text: `تعذر العثور على تفاصيل إتمام الطلب ${request.originalTransferNumber} (PO404).`});
+                //  await sock.sendMessage(request.senderJid, { text: `تعذر العثور على تفاصيل إتمام الطلب ${request.originalTransferNumber} (PO404).`});
                  delete pendingWithdrawals[requestKey];
             }
             return;
@@ -246,10 +246,10 @@ async function pollForPostOtpNote(request, requestKey, sock) { // استقبال
         const item = await response.json();
         if (!item || typeof item !== 'object') return;
         if (item.Note && (item.customer_confirmed === true || item.status === 2 || item.status === "Completed")) {
-            await sock.sendMessage(request.senderJid, { text: item.Note }); // استخدام sock.sendMessage
+            // await sock.sendMessage(request.senderJid, { text: item.Note }); // استخدام sock.sendMessage
             delete pendingWithdrawals[requestKey];
         } else if (item.Note) { 
-            await sock.sendMessage(request.senderJid, { text: item.Note }); // استخدام sock.sendMessage
+            // await sock.sendMessage(request.senderJid, { text: item.Note }); // استخدام sock.sendMessage
             request.status = "awaiting_post_otp_note"; // تحديث الحالة للانتظار لملاحظة ما بعد OTP
             request.expectedOtp = null; // مسح رمز OTP المتوقع
             request.transferDetails = item.transfer_details || null; // حفظ تفاصيل الحوالة إذا كانت موجودة
@@ -347,9 +347,9 @@ async function confirmOtpWithApi(pendingRequest, m, sock) { // استقبال so
             console.log(`[CONFIRM_OTP] API OTP confirm success for ID ${pendingRequest.apiTransferId}.`);
             const responseData = await response.json();
             if (responseData && responseData.Note) {
-                await sock.sendMessage(pendingRequest.senderJid, { text: responseData.Note }); // استخدام sock.sendMessage
+                // await sock.sendMessage(pendingRequest.senderJid, { text: responseData.Note }); // استخدام sock.sendMessage
             } else {
-                await sock.sendMessage(pendingRequest.senderJid, { text: "تم تأكيد الرمز بنجاح، ولكن لم يتم توفير ملاحظة إضافية." });
+                // await sock.sendMessage(pendingRequest.senderJid, { text: "تم تأكيد الرمز بنجاح، ولكن لم يتم توفير ملاحظة إضافية." });
             }
             return true;
         } else {
