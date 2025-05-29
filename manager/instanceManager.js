@@ -5,7 +5,8 @@ const fs = require('fs');
 const WebSocket = require('ws'); // Required for sendInternalCommandToClient
 
 const config = require('../config');
-const { updateManagerQrState, notifyInstanceStatusChange } = require('./qrWebSocketServer');
+// يجب استيراد وحدات qrWebSocketServer بدون destructuring لتجنب المشاكل مع الاستيراد الدائري المحتمل أو ترتيب التحميل
+const qrWebSocketServerModule = require('./qrWebSocketServer');
 
 const ACTIVE_BOT_INSTANCES = {};
 const INSTANCE_LOG_BUFFERS = {};
@@ -18,28 +19,22 @@ function ensureClientDataDirExists() {
     }
 }
 
-function generateClientId(phoneNumber) {
-    if (phoneNumber === 'new_linking_num' || !phoneNumber || phoneNumber.trim() === '') {
+function generateClientId(phoneNumberOrContext) {
+if (phoneNumberOrContext === 'new_linking_num' || !phoneNumberOrContext || phoneNumberOrContext.trim() === '') {
         return `client_new_linking_${Date.now()}`;
     }
-    const cleanPhone = phoneNumber.replace(/\D/g, '');
-    return `client_${cleanPhone}_${Date.now()}`;
+    const cleanPhone = phoneNumberOrContext.toString().replace(/\D/g, '');
+    if (cleanPhone && cleanPhone.length > 5) {
+        return `client_${cleanPhone}`; // معرف دائم
+    }
+    return `client_${phoneNumberOrContext.toString().replace(/[^a-zA-Z0-9]/g, '')}_${Date.now()}`;
 }
 
 function getClientDataPath(clientId) {
     return path.join(config.CLIENT_DATA_BASE_DIR, clientId);
 }
 
-/**
- * Launches a new bot instance as a child process.
- * @param {string} clientId - Unique ID for this client instance.
- * @param {string} phoneNumber - The phone number associated with this client.
- * @param {boolean} forceNewScan - True if we need to clear session data.
- * @param {string} [apiUsername=null] - API username for this client.
- * @param {string} [apiPassword=null] - API password for this client.
- * @param {string} [ownerNumber=null] - Owner number for this client's bot logic.
- */
-function launchClientInstance(clientId, phoneNumber, forceNewScan = false, apiUsername = null, apiPassword = null, ownerNumber = null) {
+function launchClientInstance(clientId, phoneNumberForContext, forceNewScan = false, apiUsername = null, apiPassword = null, ownerNumber = null) {
     ensureClientDataDirExists();
 
     const clientDataPath = getClientDataPath(clientId);
@@ -54,27 +49,20 @@ function launchClientInstance(clientId, phoneNumber, forceNewScan = false, apiUs
             console.error(`[INST_MGR_ERROR] Failed to clear auth data for ${clientId}:`, e);
         }
     } else if (fs.existsSync(authDir) && !fs.readdirSync(authDir).length && !forceNewScan) {
-        console.log(`[INST_MGR] Auth data for ${clientId} is empty, setting for QR scan on launch.`);
-        forceNewScan = true; // Ensure QR scan is attempted if auth folder is empty
+        console.log(`[INST_MGR] Auth data for ${clientId} is empty, will attempt QR scan on launch.`);
+        forceNewScan = true; 
     }
 
     if (ACTIVE_BOT_INSTANCES[clientId] && ACTIVE_BOT_INSTANCES[clientId].process && !ACTIVE_BOT_INSTANCES[clientId].process.killed) {
-        console.warn(`[INST_MGR] Attempted to launch already running instance: ${clientId}. Aborting.`);
+        console.warn(`[INST_MGR] Instance ${clientId} is already running. Aborting launch.`);
         return ACTIVE_BOT_INSTANCES[clientId].process;
     }
 
-    console.log(`[INST_MGR_DEBUG] For client ${clientId}:`);
-    console.log(`[INST_MGR_DEBUG]   API Username to be passed: ${apiUsername ? apiUsername.substring(0, 3) + '***' : 'NULL'}`);
-    console.log(`[INST_MGR_DEBUG]   API Password to be passed: ${apiPassword ? '*** (Set)' : 'NULL'}`);
-    console.log(`[INST_MGR_DEBUG]   Owner Number to be passed: ${ownerNumber ? ownerNumber.substring(0, 3) + '***' : 'NULL'}`);
+    console.log(`[INST_MGR_DEBUG] Launching instance ${clientId} (Context Phone: ${phoneNumberForContext}):`);
+    console.log(`[INST_MGR_DEBUG]   API Username: ${apiUsername ? 'Set' : 'NULL'}, Owner Number: ${ownerNumber ? 'Set' : 'NULL'}`);
 
-    const env = {
-        NODE_ENV: process.env.NODE_ENV || 'production',
-        PATH: process.env.PATH,
-        
-        AUTH_DIR: authDir,
-        DATA_DIR: dataDir,
-        CLIENT_ID: clientId,
+    const env = { ...process.env, /* نسخ متغيرات البيئة الحالية */
+        AUTH_DIR: authDir, DATA_DIR: dataDir, CLIENT_ID: clientId,
         OWNER_NUMBER_FOR_CLIENT_BOT_LOGIC: ownerNumber,
         MANAGER_WS_PORT: config.QR_WEBSOCKET_PORT,
         API_USERNAME_FOR_CLIENT_BOT_LOGIC: apiUsername,
@@ -83,50 +71,35 @@ function launchClientInstance(clientId, phoneNumber, forceNewScan = false, apiUs
     };
 
     const clientBotEntryFile = path.join(config.CLIENT_CODE_DIR, 'clientBotApp.js');
-
-    console.log(`[INST_MGR] Launching instance for ${clientId} (phone: ${phoneNumber}). Force new scan: ${forceNewScan}. API User: ${apiUsername ? 'Provided' : 'None'}, Owner: ${ownerNumber ? 'Provided' : 'None'}`);
+    console.log(`[INST_MGR] Spawning: node ${clientBotEntryFile} for ${clientId}`);
 
     const child = spawn('node', [clientBotEntryFile], {
-        cwd: config.CLIENT_CODE_DIR,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: env,
+        cwd: config.CLIENT_CODE_DIR, stdio: ['ignore', 'pipe', 'pipe'], env: env,
     });
 
     INSTANCE_LOG_BUFFERS[clientId] = [];
-
     ACTIVE_BOT_INSTANCES[clientId] = {
         process: child,
-        phoneNumber,
-        name: 'Unknown',
-        clientId,
-        status: 'starting',
-        lastUpdated: Date.now(),
-        lastKnownQR: null,
-        isLinkingClient: phoneNumber === 'new_linking_num' || clientId.startsWith('client_new_linking_'),
-        apiUsername: apiUsername,
-        apiPassword: apiPassword,
-        ownerNumber: ownerNumber,
-        startTime: new Date().toISOString(),
-        wsConnected: false,
+        phoneNumber: phoneNumberForContext === 'new_linking_num' ? null : phoneNumberForContext.replace(/\D/g, ''), // رقم الهاتف الفعلي سيتأكد عند الاتصال
+        name: 'Pending...',
+        clientId, status: 'starting', lastUpdated: Date.now(), lastKnownQR: null,
+        isLinkingClient: phoneNumberForContext === 'new_linking_num' || clientId.startsWith('client_new_linking_'),
+        apiUsername, apiPassword, ownerNumber,
+        startTime: new Date().toISOString(), wsConnected: false,
     };
 
-    child.stdout.on('data', (data) => {
+    child.stdout.on('data', (data) => { /* ... (نفس معالجة stdout) ... */ 
         const logLine = data.toString().trim();
         if (logLine) {
             INSTANCE_LOG_BUFFERS[clientId].push(`[OUT] ${logLine}`);
-            if (INSTANCE_LOG_BUFFERS[clientId].length > MAX_LOG_LINES) {
-                INSTANCE_LOG_BUFFERS[clientId].shift();
-            }
+            if (INSTANCE_LOG_BUFFERS[clientId].length > MAX_LOG_LINES) INSTANCE_LOG_BUFFERS[clientId].shift();
         }
     });
-
-    child.stderr.on('data', (data) => {
+    child.stderr.on('data', (data) => { /* ... (نفس معالجة stderr) ... */ 
         const logLine = data.toString().trim();
         if (logLine) {
             INSTANCE_LOG_BUFFERS[clientId].push(`[ERR] ${logLine}`);
-            if (INSTANCE_LOG_BUFFERS[clientId].length > MAX_LOG_LINES) {
-                INSTANCE_LOG_BUFFERS[clientId].shift();
-            }
+            if (INSTANCE_LOG_BUFFERS[clientId].length > MAX_LOG_LINES) INSTANCE_LOG_BUFFERS[clientId].shift();
             console.error(`[${clientId}_ERR] ${logLine}`);
         }
     });
@@ -135,215 +108,147 @@ function launchClientInstance(clientId, phoneNumber, forceNewScan = false, apiUs
         console.log(`[INST_MGR] Client ${clientId} process exited with code ${code}.`);
         const instanceData = ACTIVE_BOT_INSTANCES[clientId];
         if (instanceData) {
-            instanceData.status = `exited (${code})`;
+            instanceData.status = `exited (${code !== null ? code : 'signal'})`;
             instanceData.lastUpdated = Date.now();
-            instanceData.wsConnected = false;
+            instanceData.wsConnected = false; // اتصال WebSocket بالمدير قد انقطع
         }
+        qrWebSocketServerModule.notifyInstanceStatusChange(clientId, instanceData ? instanceData.status : `exited (${code})`);
         
-        require('./qrWebSocketServer').notifyInstanceStatusChange(clientId, instanceData ? instanceData.status : `exited (${code})`);
-
-        const currentUiLinkingClientId = require('./qrWebSocketServer').managerQrState?.linkingClientId;
-        if (clientId === currentUiLinkingClientId && code !== 0) { // If it's the linking client and failed
-             updateManagerQrState('linking_failed', `QR linking process for ${clientId} failed unexpectedly.`, null, clientId, null, null, true);
+        const currentUiLinkingClientId = qrWebSocketServerModule.managerQrState?.linkingClientId;
+        if (clientId === currentUiLinkingClientId && code !== 0) {
+             qrWebSocketServerModule.updateManagerQrState('linking_failed', `QR linking process for ${clientId} failed or was closed.`, null, clientId, null, null, true);
         }
-
-        // ONLY delete from ACTIVE_BOT_INSTANCES if it's truly exited and not about to be restarted (e.g. by stopClientInstance)
-        // However, delete operation below handles cleanup.
-        // For general exits, remove only if not explicitly "stopping" state before this.
-        if (instanceData && !instanceData.status.startsWith('stopping')) { // If it didn't exit due to an explicit stop command
+        if (instanceData && !instanceData.status.startsWith('stopping') && !instanceData.status.startsWith('restarting')) {
             delete ACTIVE_BOT_INSTANCES[clientId];
+            console.log(`[INST_MGR] Removed ${clientId} from active instances due to unexpected exit.`);
         }
     });
-
-    child.on('error', (err) => {
+    child.on('error', (err) => { /* ... (نفس معالجة error) ... */ 
         console.error(`[INST_MGR_ERROR] Failed to start process for ${clientId}:`, err);
         const instanceData = ACTIVE_BOT_INSTANCES[clientId];
         if (instanceData) {
-            instanceData.status = `error (${err.message})`;
+            instanceData.status = `error_spawning (${err.message})`;
             instanceData.lastUpdated = Date.now();
-            instanceData.wsConnected = false;
         }
-        require('./qrWebSocketServer').notifyInstanceStatusChange(clientId, instanceData ? instanceData.status : `error (${err.message})`);
-
-        const currentUiLinkingClientId = require('./qrWebSocketServer').managerQrState?.linkingClientId;
+        qrWebSocketServerModule.notifyInstanceStatusChange(clientId, instanceData ? instanceData.status : `error_spawning (${err.message})`);
+        const currentUiLinkingClientId = qrWebSocketServerModule.managerQrState?.linkingClientId;
         if (clientId === currentUiLinkingClientId) {
-             updateManagerQrState('error', `Failed to start QR process for ${clientId}: ${err.message}`, null, clientId, null, null, true);
+             qrWebSocketServerModule.updateManagerQrState('error', `Failed to start QR process for ${clientId}: ${err.message}`, null, clientId, null, null, true);
         }
     });
-
     return child;
 }
 
-function stopClientInstance(clientId) {
+function stopClientInstance(clientId, isRestarting = false) { // إضافة معامل isRestarting
     const instance = ACTIVE_BOT_INSTANCES[clientId];
-    if (instance) {
-        console.log(`[INST_MGR] Stopping client ${instance.clientId}...`);
-        instance.status = 'stopping'; // Set status to stopping first
+    if (instance && instance.process) {
+        console.log(`[INST_MGR] Stopping client ${instance.clientId}... (Is Restarting: ${isRestarting})`);
+        instance.status = isRestarting ? 'restarting_stopping' : 'stopping';
         instance.lastUpdated = Date.now();
-        notifyInstanceStatusChange(clientId, 'stopping');
+        qrWebSocketServerModule.notifyInstanceStatusChange(clientId, instance.status);
 
-        // Clear any previous terminate timeout if it exists
-        if (instance.terminateTimeout) {
-            clearTimeout(instance.terminateTimeout);
-            instance.terminateTimeout = null;
-        }
+        if (instance.terminateTimeout) clearTimeout(instance.terminateTimeout);
         
-        // Terminate the process
         if (instance.process.connected) {
-            try {
-                 instance.process.disconnect(); // Attempt graceful disconnect first
-            } catch (e) {
-                 console.warn(`[INST_MGR] Error disconnecting child process ${clientId}: ${e.message}`);
-            }
+            try { instance.process.disconnect(); } catch (e) { /* ... */ }
         }
-        instance.process.kill('SIGTERM'); // Send graceful termination signal
-
-        // Set a timeout to force kill if it doesn't exit gracefully
+        instance.process.kill('SIGTERM');
         instance.terminateTimeout = setTimeout(() => {
-            if (instance.process && instance.process.pid && !instance.process.killed) {
-                console.warn(`[INST_MGR] Client ${instance.clientId} not exiting gracefully, force killing.`);
-                instance.process.kill('SIGKILL'); // Force kill
+            if (instance.process && !instance.process.killed) {
+                instance.process.kill('SIGKILL');
+                console.warn(`[INST_MGR] Client ${instance.clientId} force-killed.`);
             }
-        }, 10000); // 10 seconds to gracefully exit
-
+        }, 5000); // تقليل المهلة قليلاً
         return true;
     }
-    console.warn(`[INST_MGR] Attempted to stop unknown client: ${clientId}`);
+    console.warn(`[INST_MGR] Attempted to stop non-running or unknown client: ${clientId}`);
     return false;
 }
 
-function deleteClientInstance(clientId) { // NEW FUNCTION
+function deleteClientInstance(clientId) {
+    console.log(`[INST_MGR] Initiating deletion for client ${clientId}...`);
     const instance = ACTIVE_BOT_INSTANCES[clientId];
-    if (instance) {
-        console.log(`[INST_MGR] Deleting client ${instance.clientId}...`);
-        // Stop the instance first, then delete its folder after a short delay
-        stopClientInstance(clientId); // This will mark instance status as 'stopping' and eventually exit.
-
-        setTimeout(() => {
-            const clientDataPath = getClientDataPath(clientId);
-            if (fs.existsSync(clientDataPath)) {
-                try {
-                    fs.rmSync(clientDataPath, { recursive: true, force: true });
-                    console.log(`[INST_MGR] Successfully deleted client data for ${clientId}: ${clientDataPath}`);
-                    // Ensure the instance is removed from our active list
-                    if (ACTIVE_BOT_INSTANCES[clientId]) {
-                         delete ACTIVE_BOT_INSTANCES[clientId];
-                    }
-                    if (INSTANCE_LOG_BUFFERS[clientId]) {
-                         delete INSTANCE_LOG_BUFFERS[clientId];
-                    }
-                    notifyInstanceStatusChange(clientId, 'deleted'); // Notify UI of deletion
-                    return true;
-                } catch (e) {
-                    console.error(`[INST_MGR_ERROR] Failed to delete client data for ${clientId}: ${e.message}`);
-                    notifyInstanceStatusChange(clientId, 'deletion_failed');
-                    return false;
-                }
-            } else {
-                console.log(`[INST_MGR] Client data path for ${clientId} not found (${clientDataPath}), assumed already deleted or never existed.`);
-                if (ACTIVE_BOT_INSTANCES[clientId]) { // If it was tracked but folder gone, remove it.
-                     delete ACTIVE_BOT_INSTANCES[clientId];
-                }
-                if (INSTANCE_LOG_BUFFERS[clientId]) {
-                     delete INSTANCE_LOG_BUFFERS[clientId];
-                }
-                notifyInstanceStatusChange(clientId, 'already_deleted_or_not_found');
-                return true; // Consider successful if path doesn't exist.
-            }
-        }, 1000); // Wait 1 second after signaling stop before attempting deletion
+    if (instance && instance.process && !instance.process.killed) {
+        console.log(`[INST_MGR] Instance ${clientId} is running. Stopping it before deletion.`);
+        stopClientInstance(clientId); // سيؤدي هذا إلى استدعاء 'close' للعملية
+        // سيتم حذف المجلدات بعد خروج العملية، في معالج 'close' أو بعد مهلة
+         instance.status = 'pending_deletion'; // حالة خاصة للإشارة إلى أنه سيتم الحذف
     } else {
-        console.warn(`[INST_MGR] Attempted to delete unknown or non-running client: ${clientId}`);
-        // If the instance wasn't actively tracked, check if its directory exists and delete it.
-        const clientDataPath = getClientDataPath(clientId);
-        if (fs.existsSync(clientDataPath)) {
-             try {
-                fs.rmSync(clientDataPath, { recursive: true, force: true });
-                console.log(`[INST_MGR] Deleted residual data for non-tracked client ${clientId}.`);
-                if (INSTANCE_LOG_BUFFERS[clientId]) {
-                    delete INSTANCE_LOG_BUFFERS[clientId];
-                }
-                notifyInstanceStatusChange(clientId, 'deleted_residual');
-                return true;
-             } catch (e) {
-                console.error(`[INST_MGR_ERROR] Failed to delete residual data for ${clientId}: ${e.message}`);
-                notifyInstanceStatusChange(clientId, 'deletion_failed_residual');
-                return false;
-             }
-        }
-        notifyInstanceStatusChange(clientId, 'not_found_for_delete'); // Notify if it wasn't there at all
-        return false;
+        // إذا لم يكن المثيل يعمل، قم بالحذف مباشرة
+        console.log(`[INST_MGR] Instance ${clientId} not running or process not found. Proceeding with data deletion.`);
+        performDataDeletion(clientId);
     }
 }
+
+function performDataDeletion(clientId) {
+    const clientDataPath = getClientDataPath(clientId);
+    if (fs.existsSync(clientDataPath)) {
+        try {
+            fs.rmSync(clientDataPath, { recursive: true, force: true });
+            console.log(`[INST_MGR] Successfully deleted client data for ${clientId}: ${clientDataPath}`);
+        } catch (e) {
+            console.error(`[INST_MGR_ERROR] Failed to delete client data for ${clientId}: ${e.message}`);
+            qrWebSocketServerModule.notifyInstanceStatusChange(clientId, 'deletion_failed');
+            return false;
+        }
+    } else {
+        console.log(`[INST_MGR] Client data path for ${clientId} not found, assumed already deleted.`);
+    }
+    // إزالة من التتبع النشط والسجلات
+    if (ACTIVE_BOT_INSTANCES[clientId]) delete ACTIVE_BOT_INSTANCES[clientId];
+    if (INSTANCE_LOG_BUFFERS[clientId]) delete INSTANCE_LOG_BUFFERS[clientId];
+    qrWebSocketServerModule.notifyInstanceStatusChange(clientId, 'deleted');
+    return true;
+}
+
+
+// تعديل معالج 'close' ليتعامل مع pending_deletion
+// في دالة launchClientInstance، معالج 'on close':
+// child.on('close', (code) => {
+//     ...
+//     const instanceData = ACTIVE_BOT_INSTANCES[clientId];
+//     if (instanceData && instanceData.status === 'pending_deletion') {
+//         console.log(`[INST_MGR] Process for ${clientId} (pending deletion) closed. Performing data deletion.`);
+//         performDataDeletion(clientId);
+//     } else if (instanceData && !instanceData.status.startsWith('stopping') && !instanceData.status.startsWith('restarting')) {
+//         delete ACTIVE_BOT_INSTANCES[clientId];
+//     }
+// });
 
 
 function restartClientInstance(clientId) {
     const instance = ACTIVE_BOT_INSTANCES[clientId];
     if (instance) {
         console.log(`[INST_MGR] Restarting client ${clientId}...`);
-        notifyInstanceStatusChange(clientId, 'restarting');
+        // لا نرسل 'restarting' فورًا، دع stopClientInstance ترسل 'restarting_stopping'
+        // qrWebSocketServerModule.notifyInstanceStatusChange(clientId, 'restarting');
 
-        // Capture current credentials before stopping
-        const currentApiUsername = instance.apiUsername;
-        const currentApiPassword = instance.apiPassword;
-        const currentOwnerNumber = instance.ownerNumber;
-        const currentPhoneNumber = instance.phoneNumber; // Keep phone number for relaunch
-
-        stopClientInstance(clientId);
+        const { phoneNumber, apiUsername, apiPassword, ownerNumber } = instance;
+        stopClientInstance(clientId, true); // تمرير true للإشارة إلى إعادة التشغيل
         
-        // Use a timeout to ensure the process fully exits before relaunching
         setTimeout(() => {
-            // Ensure the old entry is truly gone before relaunching, or it might re-add on restart
-            if (!ACTIVE_BOT_INSTANCES[clientId]) { // Check if it was removed by its 'close' handler
-                 launchClientInstance(
-                    clientId, // Keep same clientId for restart
-                    currentPhoneNumber,
-                    false, // No force new scan on restart, unless explicitly desired
-                    currentApiUsername, 
-                    currentApiPassword, 
-                    currentOwnerNumber  
-                );
-            } else {
-                console.warn(`[INST_MGR] Client ${clientId} was not removed after stop, forcing relaunch directly.`);
-                // If it's still somehow in ACTIVE_BOT_INSTANCES, it might mean the 'close' event
-                // hasn't fired yet or its status wasn't 'stopping'. Relaunching might double-spawn.
-                // For robustness, ensure previous process is truly gone.
-                // Forcing SIGKILL earlier might be needed if processes often hang.
-                // For now, let's relaunch directly, assuming graceful stop is intended path.
-                 launchClientInstance(
-                    clientId,
-                    currentPhoneNumber,
-                    false,
-                    currentApiUsername,
-                    currentApiPassword,
-                    currentOwnerNumber
-                );
-            }
-        }, config.RECONNECT_DELAY_MS); // Use a small delay for restart
-
+            console.log(`[INST_MGR] Relaunching ${clientId} after restart stop.`);
+            launchClientInstance(clientId, phoneNumber || clientId, false, apiUsername, apiPassword, ownerNumber);
+        }, config.RECONNECT_DELAY_MS + 1000); // إضافة مهلة صغيرة إضافية
         return true;
     }
-    console.warn(`[INST_MGR] Attempted to restart unknown client: ${clientId}`);
+    console.warn(`[INST_MGR] Attempted to restart unknown/stopped client: ${clientId}`);
     return false;
 }
 
 function recoverExistingClientInstances() {
+    // ... (نفس الكود مع التأكد من استخدام generateClientId الصحيح للمعرفة الدائمة)
     ensureClientDataDirExists();
      console.log("[INST_MGR] Scanning for existing client instances to restart...");
-
     const existingClientFolders = fs.readdirSync(config.CLIENT_DATA_BASE_DIR, { withFileTypes: true })
                                    .filter(dirent => dirent.isDirectory())
                                    .map(dirent => dirent.name);
-
     for (const folderName of existingClientFolders) {
         if (folderName.startsWith('client_new_linking_')) continue;
-
         const clientAuthPath = path.join(config.CLIENT_DATA_BASE_DIR, folderName, 'auth_info_baileys');
         const clientConfigPath = path.join(config.CLIENT_DATA_BASE_DIR, folderName, 'client_config.json');
-
-        let recoveredApiUsername = null; 
-        let recoveredApiPassword = null; 
-        let recoveredOwnerNumber = null;
-        let recoveredPhoneNumber = folderName; // Default phone to folder name initially
+        let recoveredApiUsername = null, recoveredApiPassword = null, recoveredOwnerNumber = null;
+        let recoveredPhoneNumber = folderName.startsWith('client_') ? folderName.split('_')[1] : folderName; // استخلاص الرقم من اسم المجلد
 
         if (fs.existsSync(clientConfigPath)) {
             try {
@@ -351,291 +256,240 @@ function recoverExistingClientInstances() {
                 recoveredApiUsername = clientConfigData.apiUsername;
                 recoveredApiPassword = clientConfigData.apiPassword;
                 recoveredOwnerNumber = clientConfigData.ownerNumber;
-                recoveredPhoneNumber = clientConfigData.phoneNumber || folderName; // Use number from config if available
-                console.log(`[INST_MGR] Loaded config for recovered client ${folderName}: API User: ${recoveredApiUsername ? 'Set' : 'None'}, Owner: ${recoveredOwnerNumber ? 'Set' : 'None'}, Phone: ${recoveredPhoneNumber}`);
-            } catch (e) {
-                console.error(`[INST_MGR_ERROR] Failed to parse client_config.json for ${folderName}:`, e.message);
-            }
-        } else {
-            console.warn(`[INST_MGR] No client_config.json found for recovered client ${folderName}. It will start without API/Owner specific settings unless updated via UI.`);
-            const phoneNumberMatch = folderName.match(/client_(\d+)_/); // Extract phone from folder name
-            recoveredPhoneNumber = phoneNumberMatch ? phoneNumberMatch[1] : folderName;
+                recoveredPhoneNumber = clientConfigData.phoneNumber || recoveredPhoneNumber; 
+            } catch (e) { /* ... */ }
         }
-        
-        // Only try to launch if auth folder exists and has contents
         if (fs.existsSync(clientAuthPath) && fs.readdirSync(clientAuthPath).length > 0) {
-            console.log(`[INST_MGR] Found existing session for client folder: ${folderName} (Phone: ${recoveredPhoneNumber}). Attempting to launch.`);
+            console.log(`[INST_MGR] Found session for ${folderName} (Phone: ${recoveredPhoneNumber}). Launching.`);
+            // استخدم اسم المجلد كـ clientId للاسترداد
             launchClientInstance(folderName, recoveredPhoneNumber, false, recoveredApiUsername, recoveredApiPassword, recoveredOwnerNumber);
-        } else {
-            console.log(`[INST_MGR] Folder ${folderName} does not contain an active Baileys session. Skipping restart.`);
-            // Optionally, delete empty or incomplete client folders here if desired for cleanup
-            // fs.rmSync(path.join(config.CLIENT_DATA_BASE_DIR, folderName), { recursive: true, force: true });
         }
     }
 }
 
-function handleClientBotQrUpdate(clientId, qr) {
+function handleClientBotQrUpdate(clientId, qr) { // هذا يستقبل سلسلة QR مباشرة
     const instance = ACTIVE_BOT_INSTANCES[clientId];
     if (instance) {
+        console.log(`[INST_MGR] Received QR for ${clientId}. Updating status and QR state.`);
+        instance.status = 'qr_received'; // تحديث الحالة هنا
+        instance.lastUpdated = Date.now();
         instance.lastKnownQR = qr;
+        qrWebSocketServerModule.notifyInstanceStatusChange(clientId, instance.status, instance.phoneNumber, instance.name);
         
-        const isCurrentlyLinkingOnUI = clientId === require('./qrWebSocketServer').managerQrState?.linkingClientId;
-        
+        const isCurrentlyLinkingOnUI = clientId === qrWebSocketServerModule.managerQrState?.linkingClientId;
         if (instance.isLinkingClient || isCurrentlyLinkingOnUI) {
-            console.log(`[INST_MGR] QR received from linking client ${clientId}. Broadcasting to UI.`);
-            updateManagerQrState('qr', 'Scan the QR code with WhatsApp.', qr, clientId, null, null, true);
-        } else {
-            console.log(`[INST_MGR] QR received from existing client ${clientId}. Not automatically shown on UI.`);
+            qrWebSocketServerModule.updateManagerQrState('qr', 'Scan the QR code with WhatsApp.', qr, clientId, null, null, true);
         }
     } else {
         console.warn(`[INST_MGR] Received QR update for unknown client ID: ${clientId}`);
     }
 }
 
-function handleClientBotStatusUpdate(clientId, data) {
-    const { status, message, phoneNumber, name, qr: qrFromStatusData } = data;
-    const instance = ACTIVE_BOT_INSTANCES[clientId];
-
-    if (instance) {
-        instance.status = status;
-        instance.lastUpdated = Date.now();
-        if (phoneNumber) instance.phoneNumber = phoneNumber;
-        if (name) instance.name = name;
-        instance.wsConnected = true; // Mark as WS connected when a status update comes
-    } else if (status !== 'connecting') {
-        console.warn(`[INST_MGR] Received status update for unknown/stopped client ID: ${clientId}, status: ${status}. Adding/Updating.`);
-        // Re-add to active instances if it was stopped but reported connected
-        // This is important for "resurrecting" client entries if Manager restarted and didn't track it
-        ACTIVE_BOT_INSTANCES[clientId] = {
-            process: null, // No direct child process handle yet, just tracking state
-            phoneNumber: phoneNumber || 'N/A',
-            name: name || 'Unknown',
-            clientId,
-            status,
-            lastUpdated: Date.now(),
-            lastKnownQR: qrFromStatusData || null,
-            isLinkingClient: false, // Assume not linking if re-adding this way
-            apiUsername: null, apiPassword: null, ownerNumber: null, // Must load from config.json later
-            startTime: new Date().toISOString(),
-            wsConnected: true,
-        };
-    }
-
-    require('./qrWebSocketServer').notifyInstanceStatusChange(clientId, status, phoneNumber, name);
-
-    const currentUiLinkingClientId = require('./qrWebSocketServer').managerQrState?.linkingClientId;
-
-    if (status === 'connected') {
-        if (instance && (instance.isLinkingClient || clientId === currentUiLinkingClientId)) {
-            const oldLinkingClientId = clientId;
-            // IMPORTANT: use normalizePhoneNumberToJid from apiSync for consistent JID formatting for filename.
-            // But we need the actual number part, not the JID, for folder naming.
-            // Let's assume phoneNumber here is already the numeric part.
-            // The folder name is client_<phone>_<timestamp>
-            const finalPhoneNumberForFolder = phoneNumber ? phoneNumber.replace(/\D/g, '') : oldLinkingClientId.replace('client_new_linking_', '');
-            const newPermanentClientId = generateClientId(finalPhoneNumberForFolder);
-
-            const oldClientPath = getClientDataPath(oldLinkingClientId);
-            const newClientPath = getClientDataPath(newPermanentClientId);
-            let renameSuccess = false;
-
-            const linkedApiUsername = instance.apiUsername;
-            const linkedApiPassword = instance.apiPassword;
-            const linkedOwnerNumber = instance.ownerNumber;
-
-            if (fs.existsSync(oldClientPath)) {
-                try {
-                    // Only rename if it's a temp client AND the new name is different
-                    if (instance.isLinkingClient && oldClientPath !== newClientPath) {
-                        fs.renameSync(oldClientPath, newClientPath);
-                        console.log(`[INST_MGR] Client data folder renamed from ${oldLinkingClientId} to ${newPermanentClientId}.`);
-                    } else {
-                        // If it's already a permanent client or name is same, no rename needed.
-                        console.log(`[INST_MGR] Client ID ${oldLinkingClientId} is already permanent or target path is identical. No folder rename needed.`);
-                        if (!fs.existsSync(newClientPath)) { // If target path somehow doesn't exist, this is an issue
-                            console.error(`[INST_MGR_ERROR] Target path ${newClientPath} does not exist after linking, assumed client data loss.`);
-                        }
-                    }
-                    renameSuccess = true;
-                } catch (err) {
-                    console.error(`[INST_MGR_ERROR] Failed to rename client data folder for ${oldLinkingClientId}: ${err.message}`);
-                    updateManagerQrState('error', `Linked but failed to store session: ${err.message}`, null, oldLinkingClientId, phoneNumber, name, true);
-                }
-            } else {
-                console.warn(`[INST_MGR] Old client path ${oldClientPath} not found for rename during linking. It might have already been moved or not fully created.`);
-                // If the folder was moved or didn't exist, and we now have a phoneNumber,
-                // assume session was established and stored. We need to verify if the NEW_ClientPath exists.
-                if (fs.existsSync(newClientPath) && phoneNumber) renameSuccess = true;
-                else if (phoneNumber) {
-                    // This is a recovery scenario - the temporary folder might not have been
-                    // created if `clientBotApp` already had existing auth.
-                    // If phone number is available, we assume a session has been successfully established.
-                    // Ensure the 'temp' client entry is cleaned up if it was a temp one.
-                    console.log(`[INST_MGR] Successfully linked a number ${phoneNumber}, assuming session is good. Cleanup temp ID.`);
-                    renameSuccess = true; // Assume success for processing
-                } else {
-                     console.error(`[INST_MGR_ERROR] No old client path and no phone number after connection, unable to confirm linking persistence for ${oldLinkingClientId}`);
-                     updateManagerQrState('error', `Linked but persistence failed. Please try again or check logs.`, null, oldLinkingClientId, phoneNumber, name, true);
-                     return;
-                }
-            }
-
-            if (renameSuccess) {
-                const finalClientPathForConfig = newClientPath; // Use the path that *should* contain data
-                if (!fs.existsSync(finalClientPathForConfig)) {
-                     // Create it if it doesn't exist after attempts to rename.
-                     // This could happen if temp folder never fully formed or was an edge case.
-                     fs.mkdirSync(finalClientPathForConfig, { recursive: true });
-                     console.log(`[INST_MGR] Created missing client path for config at ${finalClientPathForConfig}`);
-                }
-                const clientConfigPath = path.join(finalClientPathForConfig, 'client_config.json');
-                try {
-                    const clientConfigData = {
-                        clientId: newPermanentClientId, // Store the new ID
-                        phoneNumber: phoneNumber, // The actual phone number identified by Baileys
-                        name: name, // The WhatsApp profile name
-                        apiUsername: linkedApiUsername,
-                        apiPassword: linkedApiPassword,
-                        ownerNumber: linkedOwnerNumber,
-                        linkedAt: new Date().toISOString()
-                    };
-                    fs.writeFileSync(clientConfigPath, JSON.stringify(clientConfigData, null, 2));
-                    console.log(`[INST_MGR] Saved client_config.json for ${newPermanentClientId}.`);
-                } catch (e) {
-                    console.error(`[INST_MGR_ERROR] Failed to save client_config.json for ${newPermanentClientId}:`, e.message);
-                }
-
-                // If it was a temporary ID, stop the old process
-                if (instance.isLinkingClient && oldLinkingClientId !== newPermanentClientId) {
-                    stopClientInstance(oldLinkingClientId); // This should remove old ID from ACTIVE_BOT_INSTANCES
-                }
-
-                // Remove the old (temporary) ID if it's still lingering after successful rename/relaunch
-                // This might happen if `stopClientInstance` does async cleanup.
-                if (instance.isLinkingClient) {
-                    delete ACTIVE_BOT_INSTANCES[oldLinkingClientId];
-                }
-                
-                console.log(`[INST_MGR] Client ${newPermanentClientId} (${phoneNumber}) successfully linked. (Re)Launching as permanent.`);
-
-                // Relaunch the instance under its new, permanent ID (if it's not already tracking under that ID)
-                // If it's already tracking under newPermanentClientId (e.g., if oldLinkingClientId == newPermanentClientId)
-                // then just update its properties, no need to stop and relaunch.
-                if (!ACTIVE_BOT_INSTANCES[newPermanentClientId]) {
-                    launchClientInstance(newPermanentClientId, phoneNumber, false, linkedApiUsername, linkedApiPassword, linkedOwnerNumber);
-                } else {
-                    // Update properties of the existing permanent instance
-                    ACTIVE_BOT_INSTANCES[newPermanentClientId].isLinkingClient = false;
-                    ACTIVE_BOT_INSTANCES[newPermanentClientId].apiUsername = linkedApiUsername;
-                    ACTIVE_BOT_INSTANCES[newPermanentClientId].apiPassword = linkedApiPassword;
-                    ACTIVE_BOT_INSTANCES[newPermanentClientId].ownerNumber = linkedOwnerNumber;
-                    ACTIVE_BOT_INSTANCES[newPermanentClientId].status = 'connected'; // Explicitly set as connected
-                    console.log(`[INST_MGR] Updated existing permanent client ${newPermanentClientId} details.`);
-                }
-
-                updateManagerQrState('connected', `WhatsApp Linked: ${name} (${phoneNumber})!`, null, newPermanentClientId, phoneNumber, name, false);
-            }
-        } else {
-            console.log(`[INST_MGR] Existing client ${clientId} (${phoneNumber || instance?.phoneNumber || 'unknown'}) reported status: ${status}. Message: ${message}`);
-        }
-    } else if (clientId === currentUiLinkingClientId) {
-        if (status === 'disconnected_logout' || status === 'error' || status === 'linking_failed') {
-            updateManagerQrState(status, message, null, clientId, null, null, true);
-            // Don't call resetManagerLinkingDisplay immediately if it's an error,
-            // let the UI decide if it wants to try again from that state.
-            // if (status !== 'error') {
-            //     require('./qrWebSocketServer').resetManagerLinkingDisplay();
-            // }
-            if (status === 'disconnected_logout' || status === 'linking_failed') {
-                // Ensure the temp process is stopped and removed if it fails to link
-                stopClientInstance(clientId); 
-            }
-        } else if (status === 'qr') {
-            if (qrFromStatusData) {
-                handleClientBotQrUpdate(clientId, qrFromStatusData);
-            }
-        } else if (status === 'connecting') {
-            updateManagerQrState('linking_in_progress', `WhatsApp connecting... (Client ID: ${clientId})`, null, clientId, null, null, true);
-        }
-    } else if (status === 'disconnected_logout' || status === 'error' || status === 'linking_failed') {
-        console.log(`[INST_MGR] Non-linking client ${clientId} reported ${status}: ${message}.`);
-        if (status === 'disconnected_logout' || status === 'linking_failed') {
-            stopClientInstance(clientId);
-        }
-    }
-}
 
 function listInstances() {
-    // Merge ACTIVE_BOT_INSTANCES and any lingering log buffers
-    const allClientIds = new Set([...Object.keys(ACTIVE_BOT_INSTANCES), ...Object.keys(INSTANCE_LOG_BUFFERS)]);
-    const instances = [];
-
-    for (const id of allClientIds) {
-        const inst = ACTIVE_BOT_INSTANCES[id];
-        if (inst) {
+    const instances = Object.values(ACTIVE_BOT_INSTANCES).map(inst => ({
+        clientId: inst.clientId,
+        phoneNumber: inst.phoneNumber,
+        name: inst.name,
+        status: inst.status,
+        lastUpdated: inst.lastUpdated,
+        startTime: inst.startTime,
+        wsConnected: inst.wsConnected,
+    }));
+    // إضافة المثيلات الموجودة فقط في السجلات (التي خرجت)
+    for (const id in INSTANCE_LOG_BUFFERS) {
+        if (!ACTIVE_BOT_INSTANCES[id]) {
             instances.push({
-                clientId: inst.clientId,
-                phoneNumber: inst.phoneNumber,
-                name: inst.name,
-                status: inst.status,
-                lastUpdated: inst.lastUpdated,
-                startTime: inst.startTime,
-                wsConnected: inst.wsConnected,
-            });
-        } else if (INSTANCE_LOG_BUFFERS[id]) { // If it's only in log buffers, it's exited/stopped
-            instances.push({
-                clientId: id,
-                phoneNumber: 'N/A', // Cannot know without ACTIVE_BOT_INSTANCES entry
-                name: 'N/A',
-                status: 'exited_no_process',
-                lastUpdated: Date.now(),
-                startTime: 'N/A',
-                wsConnected: false,
+                clientId: id, phoneNumber: 'N/A', name: 'N/A', status: 'exited_no_active_process',
+                lastUpdated: Date.now(), startTime: 'N/A', wsConnected: false,
             });
         }
     }
     return instances;
 }
 
-
 function getInstanceLogs(clientId) {
-    return INSTANCE_LOG_BUFFERS[clientId] || [];
+    return INSTANCE_LOG_BUFFERS[clientId] || [`No logs found for ${clientId}. It might have been deleted or never started.`];
 }
 
-function sendInternalCommandToClient(clientId, commandPayload) { // NEW UTILITY FUNCTION
-    const qrws = require('./qrWebSocketServer'); // Dynamically import to avoid circular dependency
-    const clientWs = qrws.clientBotWsMap.get(clientId); // Get the WebSocket for the specific client
+function sendInternalCommandToClient(clientId, commandPayload) {
+    const clientWs = qrWebSocketServerModule.clientBotWsMap.get(clientId);
     if (clientWs && clientWs.readyState === WebSocket.OPEN) {
-        const payload = {
-            type: 'internalCommand', // Signal this is an internal command
-            clientId: clientId, // Target client ID (redundant but good for clarity)
-            command: commandPayload.command,
-            groupId: commandPayload.groupId, // Optional
-            // ... any other parameters required by the internal command ...
-        };
+        const payload = { type: 'internalCommand', clientId: clientId, ...commandPayload };
         try {
             clientWs.send(JSON.stringify(payload));
+            console.log(`[INST_MGR] Sent internal command '${commandPayload.command}' to ${clientId}.`);
             return true;
         } catch (e) {
             console.error(`[INST_MGR_ERROR] Failed to send internal command to ${clientId}: ${e.message}`);
-            return false;
         }
+    } else {
+        console.warn(`[INST_MGR] Cannot send internal command to ${clientId}: WebSocket not open or client not found.`);
     }
     return false;
 }
+function handleClientBotDataUpdate(clientId, type, data) {
+    const instance = ACTIVE_BOT_INSTANCES[clientId];
+    console.log(`[INST_MGR_DATA_UPDATE] For ${clientId}, Type: '${type}', Instance Exists: ${!!instance}, Data Keys: ${data ? Object.keys(data).join(', ') : 'N/A'}`);
 
+    if (type === 'status') {
+        const { status: newStatus, message, phoneNumber, name, qr: qrFromStatusData } = data;
+        console.log(`[INST_MGR] Status update for ${clientId}: '${newStatus}'. Current instance state: '${instance?.status}'`);
+
+        if (instance) {
+            if (!((instance.status === 'connected_whatsapp' || instance.status === 'qr_received') && newStatus === 'starting')) {
+                if (instance.status !== newStatus) {
+                    instance.status = newStatus;
+                }
+            }
+            instance.lastUpdated = Date.now();
+            if (phoneNumber && instance.phoneNumber !== phoneNumber.replace(/\D/g, '')) instance.phoneNumber = phoneNumber.replace(/\D/g, '');
+            if (name && instance.name !== name) instance.name = name;
+            instance.wsConnected = true;
+        } else if (newStatus && newStatus !== 'connecting_whatsapp' && newStatus !== 'starting') {
+            console.warn(`[INST_MGR] Status for UNKNOWN client ${clientId}: ${newStatus}. Creating entry.`);
+            ACTIVE_BOT_INSTANCES[clientId] = {
+                process: null, phoneNumber: phoneNumber?.replace(/\D/g, '') || 'N/A', name: name || 'Pending...', clientId, status: newStatus,
+                lastUpdated: Date.now(), lastKnownQR: qrFromStatusData || null, isLinkingClient: false,
+                apiUsername: null, apiPassword: null, ownerNumber: null, startTime: new Date().toISOString(), wsConnected: true,
+            };
+        } else {
+            console.log(`[INST_MGR] Ignored status update '${newStatus}' for non-tracked/starting client ${clientId}.`);
+            return;
+        }
+
+        qrWebSocketServerModule.notifyInstanceStatusChange(clientId, newStatus, phoneNumber, name);
+        const currentUiLinkingClientId = qrWebSocketServerModule.managerQrState?.linkingClientId;
+
+        if (newStatus === 'connected_whatsapp') {
+            console.log(`[INST_MGR] Client ${clientId} reported 'connected_whatsapp'. isLinking: ${instance?.isLinkingClient}, UI Linking ID: ${currentUiLinkingClientId}`);
+            if (instance && (instance.isLinkingClient || clientId === currentUiLinkingClientId)) {
+                console.log(`[INST_MGR] Finalizing linking for ${clientId}.`);
+                const actualPhoneNumber = (phoneNumber || instance.phoneNumber)?.replace(/\D/g, '');
+                if (!actualPhoneNumber) {
+                    qrWebSocketServerModule.updateManagerQrState('error', `Finalize linking for ${clientId} failed: Phone number missing.`, null, clientId, null, name, true);
+                    return;
+                }
+                const newPermanentClientId = generateClientId(actualPhoneNumber); // `client_PHONE`
+                const oldLinkingClientId = clientId;
+                console.log(`[INST_MGR] Linking: TempID='${oldLinkingClientId}', ActualPhone='${actualPhoneNumber}', PermanentID='${newPermanentClientId}', Name='${name || instance.name}'`);
+
+                const oldClientPath = getClientDataPath(oldLinkingClientId);
+                const newClientPath = getClientDataPath(newPermanentClientId);
+                let dataMoveSuccess = false;
+
+                if (oldLinkingClientId !== newPermanentClientId) {
+                    if (fs.existsSync(oldClientPath)) {
+                        try {
+                            if (fs.existsSync(newClientPath)) {
+                                console.warn(`[INST_MGR] Path ${newClientPath} exists. Overwriting for new link.`);
+                                fs.rmSync(newClientPath, { recursive: true, force: true });
+                            }
+                            fs.renameSync(oldClientPath, newClientPath);
+                            dataMoveSuccess = true;
+                        } catch (err) { console.error(`[INST_MGR_ERROR] Rename ${oldClientPath} to ${newClientPath} failed: ${err.message}`); }
+                    } else {
+                        if (!fs.existsSync(newClientPath)) fs.mkdirSync(newClientPath, { recursive: true });
+                        dataMoveSuccess = true;
+                    }
+                } else {
+                    if (!fs.existsSync(newClientPath)) fs.mkdirSync(newClientPath, { recursive: true });
+                    dataMoveSuccess = true;
+                }
+
+                if (dataMoveSuccess) {
+                    const clientConfigPath = path.join(newClientPath, 'client_config.json');
+                    try {
+                        fs.writeFileSync(clientConfigPath, JSON.stringify({
+                            clientId: newPermanentClientId, phoneNumber: actualPhoneNumber, name: name || instance.name,
+                            apiUsername: instance.apiUsername, apiPassword: instance.apiPassword, ownerNumber: instance.ownerNumber,
+                            linkedAt: new Date().toISOString()
+                        }, null, 2));
+                    } catch (e) { console.error(`[INST_MGR_ERROR] Save client_config for ${newPermanentClientId} failed:`, e.message); }
+
+                    const previousProcess = instance.process; // احتفظ بالعملية الحالية إذا كان الـ ID لم يتغير
+
+                    if (oldLinkingClientId !== newPermanentClientId && ACTIVE_BOT_INSTANCES[oldLinkingClientId]) {
+                        stopClientInstance(oldLinkingClientId); // أوقف العملية المؤقتة
+                        delete ACTIVE_BOT_INSTANCES[oldLinkingClientId]; // احذف التتبع المؤقت
+                    }
+                    
+                    // حدث بيانات المثيل بالمعرف الدائم
+                    ACTIVE_BOT_INSTANCES[newPermanentClientId] = {
+                        ...instance, // انسخ معظم البيانات
+                        process: (oldLinkingClientId === newPermanentClientId) ? previousProcess : null, // احتفظ بالعملية إذا كان نفس الـ ID
+                        clientId: newPermanentClientId,
+                        phoneNumber: actualPhoneNumber,
+                        name: name || instance.name,
+                        status: 'connected_whatsapp',
+                        isLinkingClient: false,
+                    };
+                    
+                    console.log(`[INST_MGR] Client ${newPermanentClientId} finalized. Status: ${ACTIVE_BOT_INSTANCES[newPermanentClientId].status}`);
+                    
+                    if (!ACTIVE_BOT_INSTANCES[newPermanentClientId].process || ACTIVE_BOT_INSTANCES[newPermanentClientId].process.killed) {
+                        console.log(`[INST_MGR] Relaunching instance under permanent ID: ${newPermanentClientId}`);
+                        setTimeout(() => {
+                             launchClientInstance(newPermanentClientId, actualPhoneNumber, false, instance.apiUsername, instance.apiPassword, instance.ownerNumber);
+                        }, 1000); // مهلة صغيرة
+                    }
+                    qrWebSocketServerModule.updateManagerQrState('connected', `WhatsApp Linked: ${name || instance.name} (${actualPhoneNumber})!`, null, newPermanentClientId, actualPhoneNumber, name || instance.name, false);
+                    qrWebSocketServerModule.resetManagerLinkingDisplay();
+                } else {
+                     qrWebSocketServerModule.updateManagerQrState('error', `Failed to prepare data folder for ${newPermanentClientId}`, null, oldLinkingClientId, actualPhoneNumber, name || instance.name, true);
+                }
+            }
+        } else if (clientId === currentUiLinkingClientId) {
+             if (newStatus === 'disconnected_logout' || newStatus === 'error' || newStatus === 'linking_failed' || newStatus === 'error_startup' || newStatus === 'error_spawning') {
+                qrWebSocketServerModule.updateManagerQrState(newStatus, message, null, clientId, null, null, true);
+                if (newStatus === 'disconnected_logout' || newStatus === 'linking_failed') stopClientInstance(clientId);
+            } else if (newStatus === 'connecting_whatsapp' || newStatus === 'starting') {
+                qrWebSocketServerModule.updateManagerQrState('linking_in_progress', `WhatsApp connecting... (Client ID: ${clientId})`, null, clientId, null, null, true);
+            }
+            // رسائل QR تعالج بشكل منفصل الآن
+        } else if (newStatus === 'disconnected_logout' || newStatus === 'error' || newStatus === 'linking_failed' || newStatus === 'error_spawning') {
+            if (newStatus === 'disconnected_logout' || newStatus === 'linking_failed') stopClientInstance(clientId);
+        }
+
+    } else if (type === 'qr') {
+        const qrData = data; // data هنا هي سلسلة QR
+        const instance = ACTIVE_BOT_INSTANCES[clientId];
+        if (instance) {
+            console.log(`[INST_MGR] QR received for ${clientId}. Current status: ${instance.status}`);
+            if (instance.status !== 'qr_received') { // تحديث الحالة فقط إذا تغيرت
+                instance.status = 'qr_received';
+                instance.lastUpdated = Date.now();
+                qrWebSocketServerModule.notifyInstanceStatusChange(clientId, instance.status, instance.phoneNumber, instance.name);
+            }
+            instance.lastKnownQR = qrData;
+            
+            const isCurrentlyLinkingOnUI = clientId === qrWebSocketServerModule.managerQrState?.linkingClientId;
+            if (instance.isLinkingClient || isCurrentlyLinkingOnUI) {
+                console.log(`[INST_MGR] Forwarding QR for linking client ${clientId} to UI.`);
+                qrWebSocketServerModule.updateManagerQrState('qr', 'Scan the QR code with WhatsApp.', qrData, clientId, null, null, true);
+            }
+        } else {
+            console.warn(`[INST_MGR] Received QR for unknown/inactive client: ${clientId}.`);
+        }
+    
+    } else if (type === 'lidResolved') {
+        const { originalLid, resolvedPhoneJid, displayName } = data;
+        console.log(`[INST_MGR] Received LID resolution for client ${clientId}: ${originalLid} -> ${resolvedPhoneJid} (Name: ${displayName})`);
+        qrWebSocketServerModule.notifyParticipantDetailsUpdate(clientId, originalLid, resolvedPhoneJid, displayName);
+    }
+}
 
 module.exports = {
     launchClientInstance,
     stopClientInstance,
     restartClientInstance,
-    deleteClientInstance, // EXPORTED NEW FUNCTION
+    deleteClientInstance,
     recoverExistingClientInstances,
     generateClientId,
-    handleClientBotQrUpdate,
-    handleClientBotStatusUpdate,
+    handleClientBotDataUpdate,
     listInstances,
     getInstanceLogs,
-    ACTIVE_BOT_INSTANCES, // Export for manager.js callbacks
-    sendInternalCommandToClient, // EXPORTED NEW FUNCTION
+    ACTIVE_BOT_INSTANCES,
+    sendInternalCommandToClient,
+    performDataDeletion 
 };

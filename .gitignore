@@ -19,3 +19,5 @@ tmp/
 Thumbs.db
 project_code_Nondjs.txt
 runToExtractCode.bat
+project_code_Nondjs.md
+mockApiServer.js

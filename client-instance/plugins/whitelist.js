@@ -3,170 +3,199 @@ const fs = require('fs');
 const path = require('path');
 const { jidNormalizedUser } = require('@whiskeysockets/baileys');
 
-const DATA_BASE_DIR = process.env.DATA_DIR;
+const DATA_BASE_DIR = process.env.DATA_DIR_FOR_CLIENT; 
 
 if (!DATA_BASE_DIR) {
-    console.error("[WHITELIST_FATAL] DATA_DIR_FOR_CLIENT environment variable is not set. Whitelist will not function correctly.");
-    // In a production environment, you might want to exit here or throw.
-    // For resilience during dev/testing, we'll try to proceed but expect issues.
+    console.error(`[${process.env.CLIENT_ID}_WHITELIST_FATAL] DATA_DIR_FOR_CLIENT environment variable is not set. Whitelist will not function correctly.`);
 }
 
-// Ensure DATA_BASE_DIR exists before defining file paths.
 const ensureDataDir = () => {
     if (!DATA_BASE_DIR) {
-        console.error("[WL_INIT_ERROR] Cannot ensure data directory: DATA_BASE_DIR is undefined.");
+        console.error(`[${process.env.CLIENT_ID}_WL_INIT_ERROR] Cannot ensure data directory: DATA_BASE_DIR is undefined.`);
         return false;
     }
     if (!fs.existsSync(DATA_BASE_DIR)) {
-        console.log(`[WL_INIT] Data directory ${DATA_BASE_DIR} does not exist, creating.`);
+        console.log(`[${process.env.CLIENT_ID}_WL_INIT] Data directory ${DATA_BASE_DIR} does not exist, creating.`);
         try {
             fs.mkdirSync(DATA_BASE_DIR, { recursive: true });
-            console.log(`[WL_INIT] Created data directory for client at: ${DATA_BASE_DIR}`);
+            console.log(`[${process.env.CLIENT_ID}_WL_INIT] Created data directory for client at: ${DATA_BASE_DIR}`);
             return true;
         } catch (e) {
-            console.error(`[WL_INIT_ERROR] Failed to create data directory ${DATA_BASE_DIR}:`, e.message);
+            console.error(`[${process.env.CLIENT_ID}_WL_INIT_ERROR] Failed to create data directory ${DATA_BASE_DIR}:`, e.message);
             return false;
         }
     } else {
-        console.log(`[WL_INIT] Data directory ${DATA_BASE_DIR} already exists.`);
+        // console.log(`[${process.env.CLIENT_ID}_WL_INIT] Data directory ${DATA_BASE_DIR} already exists.`); // Can be noisy
         return true;
     }
 };
 
-// Immediately ensure data directory when the module is loaded
 ensureDataDir();
 
-const WHITELIST_FILE = path.join(DATA_BASE_DIR, 'whitelist.json');
-const USER_GROUP_PERMISSIONS_FILE = path.join(DATA_BASE_DIR, 'user_group_permissions.json');
+const WHITELIST_FILE = DATA_BASE_DIR ? path.join(DATA_BASE_DIR, 'whitelist.json') : 'whitelist.json';
+const USER_GROUP_PERMISSIONS_FILE = DATA_BASE_DIR ? path.join(DATA_BASE_DIR, 'user_group_permissions.json') : 'user_group_permissions.json';
+const LID_CACHE_FILE = DATA_BASE_DIR ? path.join(DATA_BASE_DIR, 'lid_cache.json') : 'lid_cache.json';
+const ASKED_LIDS_FILE = DATA_BASE_DIR ? path.join(DATA_BASE_DIR, 'asked_lids.json') : 'asked_lids.json';
+const PENDING_IDS_FILE = DATA_BASE_DIR ? path.join(DATA_BASE_DIR, 'pending_identifications.json') : 'pending_identifications.json';
 
 
-// --- Initialization Functions ---
-
-const initWhitelistFile = () => {
-    if (!fs.existsSync(WHITELIST_FILE)) {
-        console.log(`[WL_INIT] Whitelist file ${WHITELIST_FILE} does not exist, creating default.`);
-        const defaultWhitelist = { users: [], groups: [], version: 1, lastUpdated: new Date().toISOString() };
+const initFile = (filePath, defaultContentGenerator, successMsg, errorMsgPrefix) => {
+    if (!fs.existsSync(filePath)) {
+        console.log(`[${process.env.CLIENT_ID}_WL_INIT] File ${filePath} does not exist, creating default.`);
+        const defaultData = defaultContentGenerator();
         try {
-            fs.writeFileSync(WHITELIST_FILE, JSON.stringify(defaultWhitelist, null, 2));
-            console.log(`[WL_INIT] Created initial client-specific whitelist.json at ${WHITELIST_FILE}`);
-            return defaultWhitelist;
+            fs.writeFileSync(filePath, JSON.stringify(defaultData, null, 2));
+            console.log(`[${process.env.CLIENT_ID}_WL_INIT] ${successMsg} at ${filePath}`);
+            return defaultData.mappings || defaultData.permissions || defaultData; // Adjust based on structure
         } catch (e) {
-            console.error(`[WL_INIT_ERROR] Failed to write default whitelist.json at ${WHITELIST_FILE}:`, e.message);
-            return { users: [], groups: [] };
+            console.error(`[${process.env.CLIENT_ID}_WL_INIT_ERROR] ${errorMsgPrefix} writing default ${filePath}:`, e.message);
+            return defaultContentGenerator().mappings || defaultContentGenerator().permissions || defaultContentGenerator();
         }
     }
     try {
-        const data = fs.readFileSync(WHITELIST_FILE, 'utf8');
+        const data = fs.readFileSync(filePath, 'utf8');
         const parsed = JSON.parse(data);
-        console.log(`[WL_INIT] Successfully loaded whitelist.json from ${WHITELIST_FILE}.`);
-        return { users: parsed.users || [], groups: parsed.groups || [], ...parsed };
+        console.log(`[${process.env.CLIENT_ID}_WL_INIT] Successfully loaded ${filePath}.`);
+        return parsed.mappings || parsed.permissions || parsed; // Adjust based on structure
     } catch (error) {
-        console.error(`[WL_INIT_ERROR] Error reading client-specific whitelist.json at ${WHITELIST_FILE}, initializing empty:`, error);
-        return { users: [], groups: [] };
+        console.error(`[${process.env.CLIENT_ID}_WL_INIT_ERROR] ${errorMsgPrefix} reading ${filePath}, initializing empty:`, error);
+        const fallbackData = defaultContentGenerator();
+        return fallbackData.mappings || fallbackData.permissions || fallbackData;
     }
 };
 
-const initUserGroupPermissionsFile = () => {
-    if (!fs.existsSync(USER_GROUP_PERMISSIONS_FILE)) {
-        console.log(`[WL_INIT] User group permissions file ${USER_GROUP_PERMISSIONS_FILE} does not exist, creating default.`);
-        const defaultPermissions = { permissions: {}, lastUpdated: new Date().toISOString() };
-        try {
-            fs.writeFileSync(USER_GROUP_PERMISSIONS_FILE, JSON.stringify(defaultPermissions, null, 2));
-            console.log(`[WL_INIT] Created initial client-specific user_group_permissions.json at ${USER_GROUP_PERMISSIONS_FILE}`);
-            return defaultPermissions.permissions;
-        } catch (e) {
-            console.error(`[WL_INIT_ERROR] Failed to write default user_group_permissions.json at ${USER_GROUP_PERMISSIONS_FILE}:`, e.message);
-            return {};
-        }
-    }
-    try {
-        const data = fs.readFileSync(USER_GROUP_PERMISSIONS_FILE, 'utf8');
-        const parsed = JSON.parse(data);
-        console.log(`[WL_INIT] Successfully loaded user_group_permissions.json from ${USER_GROUP_PERMISSIONS_FILE}.`);
-        return parsed.permissions || {};
-    } catch (error) {
-        console.error(`[WL_INIT_ERROR] Error reading client-specific user_group_permissions.json at ${USER_GROUP_PERMISSIONS_FILE}, initializing empty:`, error);
-        return {};
-    }
-};
-
-// Global variables should be initialized only once per client instance process
 if (!global.whitelist) {
-    global.whitelist = initWhitelistFile();
-    console.log(`[WL_LOAD] Client-specific: Loaded ${global.whitelist.users.length} users and ${global.whitelist.groups.length} groups.`);
+    global.whitelist = initFile(WHITELIST_FILE, () => ({ users: [], groups: [], version: 1, lastUpdated: new Date().toISOString() }), 'Created initial client-specific whitelist.json', 'Failed to');
 }
 if (!global.userGroupPermissions) {
-    global.userGroupPermissions = initUserGroupPermissionsFile();
-    console.log(`[WL_LOAD] Client-specific: Loaded group permissions for ${Object.keys(global.userGroupPermissions).length} users.`);
+    global.userGroupPermissions = initFile(USER_GROUP_PERMISSIONS_FILE, () => ({ permissions: {}, lastUpdated: new Date().toISOString() }), 'Created initial client-specific user_group_permissions.json', 'Failed to');
+}
+if (!global.lidToPhoneJidPersistentCache) {
+    global.lidToPhoneJidPersistentCache = initFile(LID_CACHE_FILE, () => ({ mappings: {}, lastUpdated: new Date().toISOString() }), 'Created initial lid_cache.json', 'Failed to');
+}
+if (!global.askedLidsCache) {
+    const loadedAskedLids = initFile(ASKED_LIDS_FILE, () => ({ mappings: {}, lastUpdated: new Date().toISOString() }), 'Created initial asked_lids.json', 'Failed to');
+    global.askedLidsCache = new Map(Object.entries(loadedAskedLids)); // Convert object to Map
+}
+if (!global.pendingLidIdentifications) {
+    const loadedPendingIds = initFile(PENDING_IDS_FILE, () => ({ mappings: {}, lastUpdated: new Date().toISOString() }), 'Created initial pending_identifications.json', 'Failed to');
+    global.pendingLidIdentifications = new Map(Object.entries(loadedPendingIds)); // Convert object to Map
 }
 
-const saveWhitelistFile = () => {
+
+const saveFile = (filePath, data, successMsg, errorMsgPrefix) => {
     try {
-        global.whitelist.lastUpdated = new Date().toISOString();
-        fs.writeFileSync(WHITELIST_FILE, JSON.stringify(global.whitelist, null, 2));
-        console.log(`[WL_SAVE_MAIN] Successfully saved client-specific whitelist.json at ${WHITELIST_FILE}`);
+        let dataToSave = data;
+        if (data instanceof Map) { // Convert Map to object for JSON serialization
+            dataToSave = Object.fromEntries(data);
+        }
+        // Ensure there's a top-level structure if needed (e.g., { mappings: ..., lastUpdated: ... })
+        let finalStructure = {};
+        if (filePath === WHITELIST_FILE) finalStructure = dataToSave; // whitelist is already in correct_disabled_options
+        else if (filePath === USER_GROUP_PERMISSIONS_FILE) finalStructure = { permissions: dataToSave, lastUpdated: new Date().toISOString() };
+        else finalStructure = { mappings: dataToSave, lastUpdated: new Date().toISOString() };
+
+
+        fs.writeFileSync(filePath, JSON.stringify(finalStructure, null, 2));
+        // console.log(`[${process.env.CLIENT_ID}_WL_SAVE] ${successMsg} at ${filePath}`); // Can be noisy
         return true;
     } catch (error) {
-        console.error(`[WL_SAVE_MAIN_ERROR] Error saving client-specific whitelist.json at ${WHITELIST_FILE}:`, error.message);
+        console.error(`[${process.env.CLIENT_ID}_WL_SAVE_ERROR] ${errorMsgPrefix} saving ${filePath}:`, error.message);
         return false;
     }
 };
 
-const saveUserGroupPermissionsFile = () => {
-    try {
-        const dataToSave = { permissions: global.userGroupPermissions, lastUpdated: new Date().toISOString() };
-        fs.writeFileSync(USER_GROUP_PERMISSIONS_FILE, JSON.stringify(dataToSave, null, 2));
-        console.log(`[WL_SAVE_PERM] Successfully saved client-specific user_group_permissions.json at ${USER_GROUP_PERMISSIONS_FILE}`);
-        return true;
-    } catch (error) {
-        console.error(`[WL_SAVE_PERM_ERROR] Error saving client-specific user_group_permissions.json at ${USER_GROUP_PERMISSIONS_FILE}:`, error.message);
-        return false;
-    }
-};
+const saveWhitelistFile = () => saveFile(WHITELIST_FILE, global.whitelist, 'Successfully saved client-specific whitelist.json', 'Error');
+const saveUserGroupPermissionsFile = () => saveFile(USER_GROUP_PERMISSIONS_FILE, global.userGroupPermissions, 'Successfully saved client-specific user_group_permissions.json', 'Error');
+const saveLidCacheFile = () => saveFile(LID_CACHE_FILE, global.lidToPhoneJidPersistentCache, 'Successfully saved lid_cache.json', 'Error');
+const saveAskedLidsFile = () => saveFile(ASKED_LIDS_FILE, global.askedLidsCache, 'Successfully saved asked_lids.json', 'Error');
+const savePendingIdsFile = () => saveFile(PENDING_IDS_FILE, global.pendingLidIdentifications, 'Successfully saved pending_identifications.json', 'Error');
+
 
 const isWhitelisted = (jid) => {
+    if (!jid) return false;
     const normalizedJid = jidNormalizedUser(jid);
-    const result = (normalizedJid.endsWith('@s.whatsapp.net') && global.whitelist.users.includes(normalizedJid)) ||
-                   (normalizedJid.endsWith('@g.us') && global.whitelist.groups.includes(normalizedJid));
-    return result;
+    
+    if (normalizedJid.endsWith('@lid')) {
+        const phoneJidFromCache = global.lidToPhoneJidPersistentCache ? global.lidToPhoneJidPersistentCache[normalizedJid] : null;
+        if (phoneJidFromCache) {
+            return global.whitelist.users.includes(phoneJidFromCache);
+        }
+        return false;
+    }
+    
+    return (normalizedJid.endsWith('@s.whatsapp.net') && global.whitelist.users.includes(normalizedJid)) ||
+           (normalizedJid.endsWith('@g.us') && global.whitelist.groups.includes(normalizedJid));
 };
 
 const formatJid = (input) => {
-    // If it's just numbers, assume it's a user and append @s.whatsapp.net
-    if (/^\d+$/.test(input)) return jidNormalizedUser(`${input}@s.whatsapp.net`);
-    // If it's a group JID (digits-timestamp@g.us), return as is after normalizing
-    if (/^\d+-\d+@g\.us$/.test(input)) return jidNormalizedUser(input);
-    // Otherwise, attempt to normalize whatever JID string is given (e.g., handles '1234567890')
-    return jidNormalizedUser(input);
+    if (!input) return null;
+    const cleanedInput = input.toString().trim();
+
+    if (/^\d+$/.test(cleanedInput)) return jidNormalizedUser(`${cleanedInput}@s.whatsapp.net`);
+    if (/^\d+(-?\d*)?@g\.us$/.test(cleanedInput)) return jidNormalizedUser(cleanedInput); 
+    if (cleanedInput.endsWith('@lid')) return jidNormalizedUser(cleanedInput);
+    if (cleanedInput.endsWith('@s.whatsapp.net')) return jidNormalizedUser(cleanedInput);
+    
+    console.warn(`[${process.env.CLIENT_ID}_WL_FORMAT_JID] Unrecognized JID format for input: "${input}", returning null.`);
+    return null;
 };
 
+const getLidToPhoneJidFromCache = (lid) => {
+    if (!lid || !lid.endsWith('@lid')) return null;
+    return global.lidToPhoneJidPersistentCache ? global.lidToPhoneJidPersistentCache[jidNormalizedUser(lid)] : null;
+};
+
+const cacheLidToPhoneJid = (lid, phoneJid) => {
+    if (!lid || !lid.endsWith('@lid') || !phoneJid || !phoneJid.endsWith('@s.whatsapp.net')) {
+        console.warn(`[${process.env.CLIENT_ID}_WL_CACHE_LID] Invalid JIDs for caching: lid=${lid}, phoneJid=${phoneJid}`);
+        return false;
+    }
+    const normalizedLid = jidNormalizedUser(lid);
+    const normalizedPhoneJid = jidNormalizedUser(phoneJid);
+
+    if (global.lidToPhoneJidPersistentCache) {
+        global.lidToPhoneJidPersistentCache[normalizedLid] = normalizedPhoneJid;
+        // console.log(`[${process.env.CLIENT_ID}_WL_CACHE_LID] Cached mapping: ${normalizedLid} -> ${normalizedPhoneJid}. Attempting to save.`);
+        return saveLidCacheFile();
+    }
+    return false;
+};
+
+const getAskedLidsCache = () => global.askedLidsCache;
+const getPendingLidIdentifications = () => global.pendingLidIdentifications;
 
 const addToWhitelist = (jidOrNumber) => {
     try {
         const jid = formatJid(jidOrNumber);
+        if (!jid) {
+            console.warn(`[${process.env.CLIENT_ID}_WL_ADD] Add to whitelist failed for "${jidOrNumber}" due to invalid JID format.`);
+            return { success: false, reason: 'invalid_jid_format' };
+        }
+
         if (jid.endsWith('@s.whatsapp.net')) {
             if (!global.whitelist.users.includes(jid)) {
                 global.whitelist.users.push(jid);
                 saveWhitelistFile();
-                console.log(`[WL_ADD] Added user ${jid} to whitelist.`);
+                console.log(`[${process.env.CLIENT_ID}_WL_ADD] Added user ${jid} to whitelist.`);
                 return { success: true, type: 'user', jid };
             }
-            console.log(`[WL_ADD] User ${jid} already whitelisted.`);
+            // console.log(`[${process.env.CLIENT_ID}_WL_ADD] User ${jid} already whitelisted.`); // Can be noisy
             return { success: false, reason: 'already_whitelisted', type: 'user', jid };
         } else if (jid.endsWith('@g.us')) {
             if (!global.whitelist.groups.includes(jid)) {
                 global.whitelist.groups.push(jid);
                 saveWhitelistFile();
-                console.log(`[WL_ADD] Added group ${jid} to whitelist.`);
+                console.log(`[${process.env.CLIENT_ID}_WL_ADD] Added group ${jid} to whitelist.`);
                 return { success: true, type: 'group', jid };
             }
-            console.log(`[WL_ADD] Group ${jid} already whitelisted.`);
+            // console.log(`[${process.env.CLIENT_ID}_WL_ADD] Group ${jid} already whitelisted.`); // Can be noisy
             return { success: false, reason: 'already_whitelisted', type: 'group', jid };
         }
-        console.warn(`[WL_ADD] Invalid JID or number format for adding to whitelist: ${jidOrNumber}`);
-        return { success: false, reason: 'invalid_jid_or_number', type: 'unknown', jid };
+        console.warn(`[${process.env.CLIENT_ID}_WL_ADD] Attempted to add non-standard JID to main whitelist: ${jidOrNumber} (Formatted: ${jid})`);
+        return { success: false, reason: 'unsupported_jid_type_for_main_whitelist', type: 'unknown', jid };
     } catch (error) {
-        console.error('[WL_ADD_ERROR] Error in addToWhitelist:', error.message);
+        console.error(`[${process.env.CLIENT_ID}_WL_ADD_ERROR] Error in addToWhitelist:`, error.message);
         return { success: false, reason: 'internal_error', type: 'unknown', error: error.message };
     }
 };
@@ -174,40 +203,61 @@ const addToWhitelist = (jidOrNumber) => {
 const removeFromWhitelist = (jidOrNumber) => {
     try {
         const jid = formatJid(jidOrNumber);
+        if (!jid) {
+             console.warn(`[${process.env.CLIENT_ID}_WL_REMOVE] Remove from whitelist failed for "${jidOrNumber}" due to invalid JID format.`);
+            return { success: false, reason: 'invalid_jid_format' };
+        }
+        
         let removed = false;
+        let itemType = '';
+
         if (jid.endsWith('@s.whatsapp.net')) {
+            itemType = 'user';
             const index = global.whitelist.users.indexOf(jid);
             if (index !== -1) {
                 global.whitelist.users.splice(index, 1);
                 removed = true;
+                if (global.lidToPhoneJidPersistentCache) {
+                    for (const lidKey in global.lidToPhoneJidPersistentCache) {
+                        if (global.lidToPhoneJidPersistentCache[lidKey] === jid) {
+                            delete global.lidToPhoneJidPersistentCache[lidKey];
+                        }
+                    }
+                    saveLidCacheFile();
+                }
+                if (global.askedLidsCache.has(jid)) { // Though unlikely for a phone JID to be a key here
+                    global.askedLidsCache.delete(jid);
+                    saveAskedLidsFile();
+                }
+                if (global.pendingLidIdentifications.has(jid)) { // Though unlikely for a phone JID to be a key here
+                    global.pendingLidIdentifications.delete(jid);
+                    savePendingIdsFile();
+                }
             }
         } else if (jid.endsWith('@g.us')) {
+            itemType = 'group';
             const index = global.whitelist.groups.indexOf(jid);
             if (index !== -1) {
                 global.whitelist.groups.splice(index, 1);
                 removed = true;
             }
         }
+
         if (removed) {
             saveWhitelistFile();
-            if (jid.endsWith('@s.whatsapp.net')) {
-                // If user is removed from whitelist, remove their specific group permissions too
-                if (global.userGroupPermissions[jid] !== undefined) {
-                    delete global.userGroupPermissions[jid];
-                    saveUserGroupPermissionsFile(); // Ensure this is saved
-                    console.log(`[WL_REMOVE] Removed user ${jid} from whitelist and cleared group permissions.`);
-                } else {
-                    console.log(`[WL_REMOVE] Removed user ${jid} from whitelist. No group permissions to clear.`);
-                }
-            } else {
-                console.log(`[WL_REMOVE] Removed group ${jid} from whitelist.`);
+            if (itemType === 'user' && global.userGroupPermissions[jid] !== undefined) {
+                delete global.userGroupPermissions[jid];
+                saveUserGroupPermissionsFile();
+                console.log(`[${process.env.CLIENT_ID}_WL_REMOVE] Removed user ${jid} from whitelist and cleared group permissions.`);
+            } else if (itemType === 'group') {
+                console.log(`[${process.env.CLIENT_ID}_WL_REMOVE] Removed group ${jid} from whitelist.`);
             }
             return { success: true, jid };
         }
-        console.log(`[WL_REMOVE] JID ${jid} not found in whitelist.`);
+        // console.log(`[${process.env.CLIENT_ID}_WL_REMOVE] JID ${jid} not found in whitelist.`); // Can be noisy
         return { success: false, reason: 'not_whitelisted', jid };
     } catch (error) {
-        console.error('[WL_REMOVE_ERROR] Error in removeFromWhitelist:', error.message);
+        console.error(`[${process.env.CLIENT_ID}_WL_REMOVE_ERROR] Error in removeFromWhitelist:`, error.message);
         return { success: false, reason: 'internal_error', error: error.message };
     }
 };
@@ -215,29 +265,22 @@ const removeFromWhitelist = (jidOrNumber) => {
 const setUserGroupPermission = (userJidOrNumber, allow) => {
     try {
         const userJid = formatJid(userJidOrNumber);
-        if (!userJid.endsWith('@s.whatsapp.net')) {
-            console.warn(`[WL_SET_PERM] Cannot set group permission for non-user JID: ${userJid}`);
+        if (!userJid || !userJid.endsWith('@s.whatsapp.net')) {
+            console.warn(`[${process.env.CLIENT_ID}_WL_SET_PERM] Cannot set group permission for non-user JID: ${userJid}`);
             return { success: false, reason: 'not_a_user_jid' };
         }
-
-        // Ensure the user is in the general whitelist before setting group permissions for them
-        // If they are not and `allow` is true, add them.
         if (!isWhitelisted(userJid) && allow === true) {
-            console.log(`[WL_SET_PERM] User ${userJid} not in general whitelist, auto-adding for group access.`);
             addToWhitelist(userJid);
         }
-        
-        // Ensure the structure exists
         if (!global.userGroupPermissions[userJid] || typeof global.userGroupPermissions[userJid] !== 'object') {
             global.userGroupPermissions[userJid] = {};
         }
-
         global.userGroupPermissions[userJid].allowed_in_groups = allow;
         saveUserGroupPermissionsFile();
-        console.log(`[WL_SET_PERM] Set group permission for ${userJid} to ${allow}.`);
+        console.log(`[${process.env.CLIENT_ID}_WL_SET_PERM] Set group permission for ${userJid} to ${allow}.`);
         return { success: true, jid: userJid, allowed: allow };
     } catch (error) {
-        console.error('[WL_SET_PERM_ERROR] Error in setUserGroupPermission:', error.message);
+        console.error(`[${process.env.CLIENT_ID}_WL_SET_PERM_ERROR] Error in setUserGroupPermission:`, error.message);
         return { success: false, reason: 'internal_error', error: error.message };
     }
 };
@@ -247,6 +290,12 @@ module.exports = {
     isWhitelisted,
     addToWhitelist,
     removeFromWhitelist,
-    saveUserGroupPermissionsFile,
+    saveUserGroupPermissionsFile, // Keep for apiSync
     setUserGroupPermission,
+    getLidToPhoneJidFromCache,
+    cacheLidToPhoneJid,
+    getAskedLidsCache,
+    saveAskedLidsFile, // Export save functions for direct use if needed
+    getPendingLidIdentifications,
+    savePendingIdsFile,
 };

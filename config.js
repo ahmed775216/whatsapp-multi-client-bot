@@ -7,6 +7,7 @@ const CLIENT_DATA_BASE_DIR = path.join(ROOT_DIR, 'client_data'); // Base directo
 
 module.exports = {
     QR_WEBSOCKET_PORT: parseInt(process.env.QR_WEBSOCKET_PORT || '8088'),
+    // API_BASE_URL: process.env.API_BASE_URL || 'http://localhost:8080/api',
     API_BASE_URL: process.env.API_BASE_URL || 'http://smartbook.selfip.com:8080/api',
     // Removed API_USERNAME, API_PASSWORD, OWNER_NUMBER from here
     // These will be passed dynamically from C#
