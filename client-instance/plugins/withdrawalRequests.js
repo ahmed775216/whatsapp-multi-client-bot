@@ -13,14 +13,14 @@ const PENDING_WITHDRAWALS_FILE = DATA_BASE_DIR ? path.join(DATA_BASE_DIR, 'pendi
 const WITHDRAWAL_API_PATH = '/withdrawal-requests';
 const INITIAL_WITHDRAWAL_API_ENDPOINT = `${config.API_BASE_URL}${WITHDRAWAL_API_PATH}`;
 const POLLING_OTP_READY_API_ENDPOINT = `${config.API_BASE_URL}${WITHDRAWAL_API_PATH}/with-confirmation-code-unprocessed`;
-const NOT_TRANSFERS_API_ENDPOINT = `${config.API_BASE_URL}${WITHDRAWAL_API_PATH}/not-transfers`; // Endpoint للطلبات التي ليست حوالات
-const PROCESSED_TRANSFERS_API_ENDPOINT = `${config.API_BASE_URL}${WITHDRAWAL_API_PATH}/success-transfers`; // Endpoint للحوالات المعالجة
+const NOT_TRANSFERS_API_ENDPOINT = `${config.API_BASE_URL}${WITHDRAWAL_API_PATH}/not-transfer`; // Endpoint/${apiTransferId}
+const NOT_TRANSFERS_LIST_API_ENDPOINT = `${config.API_BASE_URL}${WITHDRAWAL_API_PATH}/not-transfers`; // New endpoint for listconst POST_OTP_NOTE_API_ENDPOINT = `${config.API_BASE_URL}${WITHDRAWAL_API_PATH}/successful`; // Endpoint/${apiTransferId}
 const POST_OTP_NOTE_API_ENDPOINT = `${config.API_BASE_URL}${WITHDRAWAL_API_PATH}/successful`; // Endpoint/${apiTransferId}
 const CONFIRM_WITHDRAWAL_API_ENDPOINT_BASE = `${config.API_BASE_URL}${WITHDRAWAL_API_PATH}`;
 
 let pendingWithdrawals = loadPendingWithdrawals();
 let pollingIntervalId = null;
-const POLLING_INTERVAL_MS = 15000; // 15 ثانية (يمكن تعديلها)
+const POLLING_INTERVAL_MS = 20000; // Increased to 20 seconds to reduce API calls
 // const GENERAL_REQUEST_STALE_MS = 3 * 60 * 60 * 1000; // 3 ساعات كحد أقصى لطلب معلق بدون OTP
 
 // --- File Operations ---
@@ -39,7 +39,205 @@ function savePendingWithdrawals() {
         return false;
     }
 }
+/*
+Looking at your code, I'll help you implement polling for both not-transfer endpoints. Here's the updated code with the new functionality:
 
+```javascript
+// Add this new constant at the top with other API endpoints
+const NOT_TRANSFERS_LIST_API_ENDPOINT = `${config.API_BASE_URL}${WITHDRAWAL_API_PATH}/not-transfers`; // New endpoint for list
+*/
+
+// Add this new function to get the list of not-transfers
+async function getNotTransfersList() {
+    let apiToken = getApiToken();
+    if (!apiToken) {
+        apiToken = await loginToApi();
+        if (!apiToken) throw new Error("Failed to login to API for fetching not-transfers list.");
+    }
+    try {
+        const response = await fetch(NOT_TRANSFERS_LIST_API_ENDPOINT, {
+            method: 'GET',
+            headers: { 'Authorization': `Bearer ${apiToken}`, 'Accept': 'application/json' },
+            timeout: 15000,
+        });
+        if (!response.ok) {
+            console.error(`[GET_NOT_TRANSFERS_LIST] API error: ${response.status}`);
+            return null;
+        }
+        const responseData = await response.json();
+        if (!responseData || !Array.isArray(responseData.data)) {
+            console.error(`[GET_NOT_TRANSFERS_LIST] Invalid API response. Expected data array.`, responseData);
+            return null;
+        }
+        console.log(`[GET_NOT_TRANSFERS_LIST] Found ${responseData.data.length} not-transfer items.`);
+        return responseData.data;
+    } catch (error) {
+        console.error(`[GET_NOT_TRANSFERS_LIST] Error fetching not-transfers list:`, error);
+        return null;
+    }
+}
+
+// Update the pollForOtpReadyOrNotTransfer function
+async function pollForOtpReadyOrNotTransfer(request, requestKey, sock) { 
+    console.log(`[POLL_OTP_READY] Key: ${requestKey}, API_ID: ${request.apiTransferId}, OrigNum: ${request.originalTransferNumber}`);
+
+    // First, check the not-transfers list endpoint
+    try {
+        console.log(`[POLL_OTP_READY] Checking not-transfers list endpoint`);
+        const notTransfersList = await getNotTransfersList();
+        if (notTransfersList && notTransfersList.length > 0) {
+            // Find matching item by API ID or by contact_id and original_transfer_number
+            const notTransferItem = notTransfersList.find(item => 
+                (request.apiTransferId && item.id && item.id.toString() === request.apiTransferId.toString()) ||
+                (item.contact_id && item.contact_id.toString() === request.contactId.toString() && 
+                 item.original_transfer_number && item.original_transfer_number.toString() === request.originalTransferNumber.toString())
+            );
+            
+            if (notTransferItem && notTransferItem.notes && notTransferItem.status === 1 && !notTransferItem.customer_confirmed) {
+                console.log(`[POLL_OTP_READY] Found not-transfer note in list for ${requestKey}:`, notTransferItem.notes);
+                await sock.sendMessage(request.senderJid, { text: `${notTransferItem.notes}` });
+                // Mark request as completed and remove it
+                delete pendingWithdrawals[requestKey];
+                savePendingWithdrawals();
+                return;
+            }
+        }
+    } catch (error) {
+        console.error(`[POLL_OTP_READY] Error checking not-transfers list for ${requestKey}:`, error);
+    }
+
+    // Then check the individual not-transfer endpoint if we have an API ID
+    if (request.apiTransferId) {
+        try {
+            console.log(`[POLL_OTP_READY] Checking individual not-transfer endpoint for API ID: ${request.apiTransferId}`);
+            const notTransfer = await getNotTransfer(request.apiTransferId);
+            if (notTransfer && notTransfer.notes && notTransfer.status === 1 && !notTransfer.customer_confirmed) {
+                console.log(`[POLL_OTP_READY] Found not-transfer note for ${requestKey}:`, notTransfer.notes);
+                await sock.sendMessage(request.senderJid, { text: `${notTransfer.notes}` });
+                // Mark request as completed and remove it
+                delete pendingWithdrawals[requestKey];
+                savePendingWithdrawals();
+                return;
+            } else {
+                console.log(`[POLL_OTP_READY] No valid not-transfer note found for API ID ${request.apiTransferId}.`);
+            }
+        } catch (error) {
+            console.error(`[POLL_OTP_READY] Error checking individual not-transfer for ${requestKey}:`, error);
+        }
+    }
+
+    // Finally check the OTP ready endpoint
+    try {
+        const response = await fetchWithToken(POLLING_OTP_READY_API_ENDPOINT);
+        if (!response.ok) {
+            console.error(`[POLL_OTP_READY] API error list for ${requestKey}: ${response.status}`);
+            return;
+        }
+        const responseData = await response.json();
+        if (!responseData || !Array.isArray(responseData.data)) {
+            console.error(`[POLL_OTP_READY] Invalid API response for ${requestKey}. Expected data array.`, responseData);
+            return;
+        }
+        const item = responseData.data.find(d =>
+            (request.apiTransferId && d.id && d.id.toString() === request.apiTransferId.toString()) ||
+            (d.contact_id && d.contact_id.toString() === request.contactId.toString() && d.original_transfer_number && d.original_transfer_number.toString() === request.originalTransferNumber.toString())
+        );
+        if (!item) {
+            console.log(`[POLL_OTP_READY] Request ${requestKey} (ID: ${request.apiTransferId}, OrigNum: ${request.originalTransferNumber}) not found in "with-confirmation-code-unprocessed" list.`);
+            return;
+        }
+        console.log(`[POLL_OTP_READY] Found item for ${requestKey}:`, item);
+        if (item.confirmation_code && item.status === 0 && item.customer_confirmed === false) {
+            request.status = "awaiting_otp_confirmation";
+            request.expectedOtp = item.confirmation_code.toString();
+            request.transferDetails = item.transfer_details;
+            request.apiTransferId = item.id; 
+            const userMessage = `تفاصيل الحوالة:\n${item.transfer_details}\n\nرمز التأكيد (OTP) الخاص بك هو:\n\`\`\`${item.confirmation_code}\`\`\`\n\nالرجاء إعادة إرسال رمز التأكيد فقط لتأكيد عملية السحب.`;
+            await sock.sendMessage(request.senderJid, { text: userMessage }); 
+        } else if (item.notes && item.status === 1 && !item.customer_confirmed) { 
+            console.log(`[POLL_OTP_READY] Found notes in OTP ready endpoint for ${requestKey}:`, item.notes);
+            await sock.sendMessage(request.senderJid, { text: `${item.notes}` });
+            delete pendingWithdrawals[requestKey];
+            savePendingWithdrawals();
+        } else if (item.status === 1 && !item.confirmation_code && !item.customer_confirmed) {
+            request.status = "awaiting_not_transfer_note";
+            request.apiTransferId = item.id;
+        } else { 
+            console.log(`[POLL_OTP_READY] Item for ${requestKey} does not match expected conditions for OTP or Note. Item:`, item);
+        }
+    } catch (error) {
+        console.error(`[POLL_OTP_READY] Error polling for ${requestKey}:`, error);
+    }
+}
+
+// Also update the pollAllPendingRequests function to handle the new status if needed
+async function pollAllPendingRequests() {
+    if (!localSock) {
+        console.warn('[WITHDRAWAL_REQ_POLL_ALL] localSock not initialized. Skipping poll cycle.');
+        stopPolling(); 
+        return;
+    }
+    console.log(`[WITHDRAWAL_REQ_POLL_ALL] Polling ${Object.keys(pendingWithdrawals).length} pending withdrawal requests...`);
+    let activePollingNeeded = false;
+
+    for (const key in pendingWithdrawals) {
+        const request = pendingWithdrawals[key];
+        if (!request || !request.status || !request.senderJid) { 
+            console.warn(`[WITHDRAWAL_REQ_POLL_ALL] Invalid or incomplete request object for key ${key}:`, request);
+            delete pendingWithdrawals[key]; 
+            savePendingWithdrawals();
+            continue;
+        }
+        
+        request.lastPollTimestamp = Date.now();
+        activePollingNeeded = true;
+
+        switch (request.status) {
+            case "pending_api_processing":
+            case "awaiting_not_transfer_note": // Also poll for not-transfer notes
+                await pollForOtpReadyOrNotTransfer(request, key, localSock); 
+                break;
+            case "awaiting_post_otp_note": 
+                await pollForPostOtpNote(request, key, localSock); 
+                break;
+            case "awaiting_otp_confirmation":
+                console.log(`[WITHDRAWAL_REQ_POLL_ALL] Request ${key} is awaiting OTP confirmation.`);
+                break; 
+            case "otp_received_processing":
+                console.log(`[WITHDRAWAL_REQ_POLL_ALL] Request ${key} is processing OTP confirmation.`);
+                break;
+            default:
+                console.warn(`[WITHDRAWAL_REQ_POLL_ALL] Unknown status for request ${key}: ${request.status}`);
+                break;
+        }
+    }
+    savePendingWithdrawals(); 
+
+    if (Object.keys(pendingWithdrawals).length === 0) {
+        console.log("[WITHDRAWAL_REQ_POLL_ALL] All pending requests processed. Stopping polling.")
+        stopPolling();
+    } else {
+        console.log(`[WITHDRAWAL_REQ_POLL_ALL] Polling cycle completed. Active requests: ${Object.keys(pendingWithdrawals).length}`);
+    }
+}
+/*```
+
+The key changes I made:
+
+1. **Added new endpoint constant** `NOT_TRANSFERS_LIST_API_ENDPOINT` for the `/not-transfers` endpoint
+
+2. **Created `getNotTransfersList()` function** that fetches the array of not-transfer items from the list endpoint
+
+3. **Updated `pollForOtpReadyOrNotTransfer()`** to:
+   - First check the not-transfers list endpoint
+   - Then check the individual not-transfer endpoint (if API ID exists)
+   - Finally check the OTP ready endpoint
+   - This ensures comprehensive polling coverage
+
+4. **Added handling for `awaiting_not_transfer_note` status** in the polling cycle to ensure these requests are also polled
+
+The polling now checks both endpoints for not-transfer notes, improving the chances of catching any notes that might be available through either endpoint. The function will find matching items by either API ID or by the combination of contact_id and original_transfer_number.
+*/
 function loadPendingWithdrawals() {
     if (!DATA_BASE_DIR || !fs.existsSync(PENDING_WITHDRAWALS_FILE)) {
         console.log(`[WITHDRAWAL_REQ_LOAD] Pending withdrawals file path not valid or file does not exist. Path: ${PENDING_WITHDRAWALS_FILE}`);
@@ -94,57 +292,54 @@ function stopPolling() {
     }
 }
 
-async function pollAllPendingRequests() {
-    if (!localSock) { // تحقق إضافي هنا
-        console.warn('[WITHDRAWAL_REQ_POLL_ALL] localSock not initialized. Skipping poll cycle.');
-        stopPolling(); 
-        return;
-    }
-    console.log(`[WITHDRAWAL_REQ_POLL_ALL] Polling ${Object.keys(pendingWithdrawals).length} pending withdrawal requests...`);
-    let activePollingNeeded = false; // This will remain true if there are any pending requests
+// async function pollAllPendingRequests() {
+//     if (!localSock) { // تحقق إضافي هنا
+//         console.warn('[WITHDRAWAL_REQ_POLL_ALL] localSock not initialized. Skipping poll cycle.');
+//         stopPolling(); 
+//         return;
+//     }
+//     console.log(`[WITHDRAWAL_REQ_POLL_ALL] Polling ${Object.keys(pendingWithdrawals).length} pending withdrawal requests...`);
+//     let activePollingNeeded = false; // This will remain true if there are any pending requests
 
-    for (const key in pendingWithdrawals) {
-        const request = pendingWithdrawals[key];
-        if (!request || !request.status || !request.senderJid) { 
-            console.warn(`[WITHDRAWAL_REQ_POLL_ALL] Invalid or incomplete request object for key ${key}:`, request);
-            delete pendingWithdrawals[key]; 
-            savePendingWithdrawals();
-            continue;
-        }
+//     for (const key in pendingWithdrawals) {
+//         const request = pendingWithdrawals[key];
+//         if (!request || !request.status || !request.senderJid) { 
+//             console.warn(`[WITHDRAWAL_REQ_POLL_ALL] Invalid or incomplete request object for key ${key}:`, request);
+//             delete pendingWithdrawals[key]; 
+//             savePendingWithdrawals();
+//             continue;
+//         }
         
-        request.lastPollTimestamp = Date.now();
-        activePollingNeeded = true; // A request is being processed, so polling is needed
+//         request.lastPollTimestamp = Date.now();
+//         activePollingNeeded = true; // A request is being processed, so polling is needed
 
-        switch (request.status) {
-            case "pending_api_processing":
-                await pollForOtpReadyOrNotTransfer(request, key, localSock); 
-                break;
-            case "awaiting_not_transfer_note":
-                await pollForNotTransferNote(request, key, localSock); 
-                break;
-            case "awaiting_post_otp_note": 
-                await pollForPostOtpNote(request, key, localSock); 
-                break;
-            case "awaiting_otp_confirmation":
-                // This state requires user input, but polling continues for other requests or state changes.
-                break; 
-            case "otp_received_processing":
-                console.log(`[WITHDRAWAL_REQ_POLL_ALL] Request ${key} is processing OTP confirmation.`);
-                break;
-            default:
-                console.warn(`[WITHDRAWAL_REQ_POLL_ALL] Unknown status for request ${key}: ${request.status}`);
-                break;
-        }
-    }
-    savePendingWithdrawals(); 
+//         switch (request.status) {
+//             case "pending_api_processing":
+//                 await pollForOtpReadyOrNotTransfer(request, key, localSock); 
+//                 break;
+//             case "awaiting_post_otp_note": 
+//                 await pollForPostOtpNote(request, key, localSock); 
+//                 break;
+//             case "awaiting_otp_confirmation":
+//                 // This state requires user input, but polling continues for other requests or state changes.
+//                 break; 
+//             case "otp_received_processing":
+//                 console.log(`[WITHDRAWAL_REQ_POLL_ALL] Request ${key} is processing OTP confirmation.`);
+//                 break;
+//             default:
+//                 console.warn(`[WITHDRAWAL_REQ_POLL_ALL] Unknown status for request ${key}: ${request.status}`);
+//                 break;
+//         }
+//     }
+//     savePendingWithdrawals(); 
 
-    if (Object.keys(pendingWithdrawals).length === 0) {
-        console.log("[WITHDRAWAL_REQ_POLL_ALL] All pending requests processed. Stopping polling.")
-        stopPolling();
-    } else {
-        console.log(`[WITHDRAWAL_REQ_POLL_ALL] Polling cycle completed. Active requests: ${Object.keys(pendingWithdrawals).length}`);
-    }
-}
+//     if (Object.keys(pendingWithdrawals).length === 0) {
+//         console.log("[WITHDRAWAL_REQ_POLL_ALL] All pending requests processed. Stopping polling.")
+//         stopPolling();
+//     } else {
+//         console.log(`[WITHDRAWAL_REQ_POLL_ALL] Polling cycle completed. Active requests: ${Object.keys(pendingWithdrawals).length}`);
+//     }
+// }
 
 async function getProcessedTransferDetails(apiTransferId) {
     let apiToken = getApiToken();
@@ -178,6 +373,34 @@ async function getProcessedTransferDetails(apiTransferId) {
         return item.transfer_details || null; 
     } catch (error) {
         console.error(`[GET_PROCESSED_TRANSFER] Error fetching processed transfer for ID ${apiTransferId}:`, error);
+        return null;
+    }
+}
+
+async function getNotTransfer(apiTransferId) {
+    let apiToken = getApiToken();
+    if (!apiToken) {
+        apiToken = await loginToApi();
+        if (!apiToken) throw new Error("Failed to login to API for fetching not-transfer notes.");
+    }
+    try {
+        const response = await fetch(`${NOT_TRANSFERS_API_ENDPOINT}/${apiTransferId}`, {
+            method: 'GET',
+            headers: { 'Authorization': `Bearer ${apiToken}`, 'Accept': 'application/json' },
+            timeout: 15000, 
+        });
+        if (!response.ok) {
+            console.error(`[GET_NOT_TRANSFER] API error for ID ${apiTransferId}: ${response.status}`);
+            return null;
+        }
+        const responseData = await response.json();
+        if (!responseData || typeof responseData.data !== 'object') { 
+            console.error(`[GET_NOT_TRANSFER] Invalid API response structure for ID ${apiTransferId}. Expected data object.`, responseData);
+            return null;
+        }
+        return responseData.data; 
+    } catch (error) {
+        console.error(`[GET_NOT_TRANSFER] Error fetching not-transfer notes for ID ${apiTransferId}:`, error);
         return null;
     }
 }
@@ -231,96 +454,69 @@ async function fetchWithToken(url, options = {}) {
     return fetch(url, { ...defaultOptions, ...options });
 }
 
-async function pollForOtpReadyOrNotTransfer(request, requestKey, sock) { 
-    console.log(`[POLL_OTP_READY] Key: ${requestKey}, API_ID: ${request.apiTransferId}, OrigNum: ${request.originalTransferNumber}`);
-    try {
-        const response = await fetchWithToken(POLLING_OTP_READY_API_ENDPOINT);
-        if (!response.ok) {
-            console.error(`[POLL_OTP_READY] API error list for ${requestKey}: ${response.status}`);
-            return;
-        }
-        const responseData = await response.json();
-        if (!responseData || !Array.isArray(responseData.data)) {
-            console.error(`[POLL_OTP_READY] Invalid API response for ${requestKey}. Expected data array.`, responseData);
-            return;
-        }
-        const item = responseData.data.find(d =>
-            (request.apiTransferId && d.id && d.id.toString() === request.apiTransferId.toString()) ||
-            (d.contact_id && d.contact_id.toString() === request.contactId.toString() && d.original_transfer_number && d.original_transfer_number.toString() === request.originalTransferNumber.toString())
-        );
-        if (!item) {
-            console.log(`[POLL_OTP_READY] Request ${requestKey} (ID: ${request.apiTransferId}, OrigNum: ${request.originalTransferNumber}) not found in "with-confirmation-code-unprocessed" list.`);
-            return;
-        }
-        console.log(`[POLL_OTP_READY] Found item for ${requestKey}:`, item);
-        if (item.confirmation_code && item.status === 0 && item.customer_confirmed === false) {
-            request.status = "awaiting_otp_confirmation";
-            request.expectedOtp = item.confirmation_code.toString();
-            request.transferDetails = item.transfer_details;
-            request.apiTransferId = item.id; 
-            const userMessage = `تفاصيل الحوالة:\n${item.transfer_details}\n\nرمز التأكيد (OTP) الخاص بك هو:\n\`\`\`${item.confirmation_code}\`\`\`\n\nالرجاء إعادة إرسال رمز التأكيد فقط لتأكيد عملية السحب.`;
-            await sock.sendMessage(request.senderJid, { text: userMessage }); 
-        } else if (item.Note) { // Assuming this endpoint uses 'Note' for direct messages
-            await sock.sendMessage(request.senderJid, { text: item.Note }); 
-            delete pendingWithdrawals[requestKey];
-        } else if (item.notes) { // Fallback check for 'notes' if 'Note' is not present
-             await sock.sendMessage(request.senderJid, { text: item.notes }); 
-             delete pendingWithdrawals[requestKey];
-        } else if (item.status === 1 && !item.confirmation_code && !item.customer_confirmed) {
-            request.status = "awaiting_not_transfer_note";
-            request.apiTransferId = item.id;
-        } else { 
-            console.log(`[POLL_OTP_READY] Item for ${requestKey} does not match expected conditions for OTP or Note. Item:`, item);
-        }
-    } catch (error) {
-        console.error(`[POLL_OTP_READY] Error polling for ${requestKey}:`, error);
-    }
-}
+// async function pollForOtpReadyOrNotTransfer(request, requestKey, sock) { 
+//     console.log(`[POLL_OTP_READY] Key: ${requestKey}, API_ID: ${request.apiTransferId}, OrigNum: ${request.originalTransferNumber}`);
 
-async function pollForNotTransferNote(request, requestKey, sock) { 
-    console.log(`[POLL_NOT_TRANSFER] Key: ${requestKey}, API_ID: ${request.apiTransferId}`);
-    if (!request.apiTransferId) { 
-        console.warn(`[POLL_NOT_TRANSFER] apiTransferId missing for ${requestKey}. Removing.`);
-        delete pendingWithdrawals[requestKey]; 
-        return; 
-    }
-    try {
-        const response = await fetchWithToken(`${NOT_TRANSFERS_API_ENDPOINT}?id=${request.apiTransferId}`);
-        if (!response.ok) {
-            if (response.status === 404) {
-                await sock.sendMessage(request.senderJid, { text: `تعذر العثور على تفاصيل الطلب ${request.originalTransferNumber} (NT404).`});
-                delete pendingWithdrawals[requestKey];
-            } else {
-                console.error(`[POLL_NOT_TRANSFER] API error for ${requestKey}: ${response.status}`);
-            }
-            return;
-        }
-        const responseData = await response.json();
-        // This endpoint might return a single object or an array with one item if queried by ID.
-        // The original code handled both if responseData itself was the item or if it was in responseData.data[0]
-        let item = null;
-        if (Array.isArray(responseData.data) && responseData.data.length > 0) {
-            item = responseData.data.find(d => d.id && d.id.toString() === request.apiTransferId.toString());
-        } else if (responseData.id && responseData.id.toString() === request.apiTransferId.toString()) {
-            item = responseData; // If responseData is the item itself
-        } else if (responseData.data && responseData.data.id && responseData.data.id.toString() === request.apiTransferId.toString()) {
-            item = responseData.data; // If item is nested under 'data' as an object
-        }
+//     // First, check if the request has an API ID and try the not-transfer endpoint
+//     if (request.apiTransferId) {
+//         try {
+//             console.log(`[POLL_OTP_READY] Checking not-transfer endpoint for API ID: ${request.apiTransferId}`);
+//             const notTransfer = await getNotTransfer(request.apiTransferId);
+//             if (notTransfer && notTransfer.notes && notTransfer.status === 1 && !notTransfer.customer_confirmed) {
+//                 console.log(`[POLL_OTP_READY] Found not-transfer note for ${requestKey}:`, notTransfer.notes);
+//                 await sock.sendMessage(request.senderJid, { text: `${notTransfer.notes}` });
+//                 // Mark request as completed and remove it
+//                 delete pendingWithdrawals[requestKey];
+//                 savePendingWithdrawals();
+//                 return;
+//             } else {
+//                 console.log(`[POLL_OTP_READY] No valid not-transfer note found for API ID ${request.apiTransferId}.`);
+//             }
+//         } catch (error) {
+//             console.error(`[POLL_OTP_READY] Error checking not-transfer for ${requestKey}:`, error);
+//         }
+//     }
 
-
-        if (item && item.Note) { // Assuming this endpoint uses 'Note'
-            await sock.sendMessage(request.senderJid, { text: item.Note }); 
-            delete pendingWithdrawals[requestKey];
-        } else if (item && item.notes) { // Fallback for 'notes'
-            await sock.sendMessage(request.senderJid, { text: item.notes }); 
-            delete pendingWithdrawals[requestKey];
-        } else if (item) {
-            console.log(`[POLL_NOT_TRANSFER] Item found for ${requestKey} but no Note/notes. Item:`, item);
-        } else {
-             console.log(`[POLL_NOT_TRANSFER] No item/notes found for ${requestKey} with ID ${request.apiTransferId}. Response:`, responseData);
-        }
-    } catch (error) { console.error(`[POLL_NOT_TRANSFER] Error for ${requestKey}:`, error); }
-}
+//     // Then check the OTP ready endpoint
+//     try {
+//         const response = await fetchWithToken(POLLING_OTP_READY_API_ENDPOINT);
+//         if (!response.ok) {
+//             console.error(`[POLL_OTP_READY] API error list for ${requestKey}: ${response.status}`);
+//             return;
+//         }
+//         const responseData = await response.json();
+//         if (!responseData || !Array.isArray(responseData.data)) {
+//             console.error(`[POLL_OTP_READY] Invalid API response for ${requestKey}. Expected data array.`, responseData);
+//             return;
+//         }
+//         const item = responseData.data.find(d =>
+//             (request.apiTransferId && d.id && d.id.toString() === request.apiTransferId.toString()) ||
+//             (d.contact_id && d.contact_id.toString() === request.contactId.toString() && d.original_transfer_number && d.original_transfer_number.toString() === request.originalTransferNumber.toString())
+//         );
+//         if (!item) {
+//             console.log(`[POLL_OTP_READY] Request ${requestKey} (ID: ${request.apiTransferId}, OrigNum: ${request.originalTransferNumber}) not found in "with-confirmation-code-unprocessed" list.`);
+//             return;
+//         }
+//         console.log(`[POLL_OTP_READY] Found item for ${requestKey}:`, item);
+//         if (item.confirmation_code && item.status === 0 && item.customer_confirmed === false) {
+//             request.status = "awaiting_otp_confirmation";
+//             request.expectedOtp = item.confirmation_code.toString();
+//             request.transferDetails = item.transfer_details;
+//             request.apiTransferId = item.id; 
+//             const userMessage = `تفاصيل الحوالة:\n${item.transfer_details}\n\nرمز التأكيد (OTP) الخاص بك هو:\n\`\`\`${item.confirmation_code}\`\`\`\n\nالرجاء إعادة إرسال رمز التأكيد فقط لتأكيد عملية السحب.`;
+//             await sock.sendMessage(request.senderJid, { text: userMessage }); 
+//         } else if (item.notes && item.status === 1 && !item.customer_confirmed) { 
+//             // Handle notes case if needed
+//         } else if (item.status === 1 && !item.confirmation_code && !item.customer_confirmed) {
+//             request.status = "awaiting_not_transfer_note";
+//             request.apiTransferId = item.id;
+//         } else { 
+//             console.log(`[POLL_OTP_READY] Item for ${requestKey} does not match expected conditions for OTP or Note. Item:`, item);
+//         }
+//     } catch (error) {
+//         console.error(`[POLL_OTP_READY] Error polling for ${requestKey}:`, error);
+//     }
+// }
 
 async function pollForPostOtpNote(request, requestKey, sock) { 
     console.log(`[POLL_POST_OTP_NOTE] Key: ${requestKey}, API_ID: ${request.apiTransferId}`);
@@ -546,11 +742,5 @@ module.exports = {
             await handleOtpConfirmation(m, sender, receivedOtp);
             return {};
         }
-        if (Math.random() < 0.05) { 
-             cleanupOldStaleRequests();
-        }
-        return;
-    },
-    stopPollingOnShutdown: stopPolling,
-    savePendingOnShutdown: savePendingWithdrawals,
-};
+    }
+}
