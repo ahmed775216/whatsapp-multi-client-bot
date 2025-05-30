@@ -15,6 +15,7 @@ const INITIAL_WITHDRAWAL_API_ENDPOINT = `${config.API_BASE_URL}${WITHDRAWAL_API_
 const POLLING_OTP_READY_API_ENDPOINT = `${config.API_BASE_URL}${WITHDRAWAL_API_PATH}/with-confirmation-code-unprocessed`;
 const NOT_TRANSFERS_API_ENDPOINT = `${config.API_BASE_URL}${WITHDRAWAL_API_PATH}/not-transfers`; // Endpoint للطلبات التي ليست حوالات
 const PROCESSED_TRANSFERS_API_ENDPOINT = `${config.API_BASE_URL}${WITHDRAWAL_API_PATH}/success-transfers`; // Endpoint للحوالات المعالجة
+const POST_OTP_NOTE_API_ENDPOINT = `${config.API_BASE_URL}${WITHDRAWAL_API_PATH}/successful`; // Endpoint/${apiTransferId}
 const CONFIRM_WITHDRAWAL_API_ENDPOINT_BASE = `${config.API_BASE_URL}${WITHDRAWAL_API_PATH}`;
 
 let pendingWithdrawals = loadPendingWithdrawals();
@@ -100,57 +101,119 @@ async function pollAllPendingRequests() {
         return;
     }
     console.log(`[WITHDRAWAL_REQ_POLL_ALL] Polling ${Object.keys(pendingWithdrawals).length} pending withdrawal requests...`);
-    let activePollingNeeded = false;
+    let activePollingNeeded = false; // This will remain true if there are any pending requests
 
     for (const key in pendingWithdrawals) {
         const request = pendingWithdrawals[key];
-        if (!request || !request.status || !request.senderJid) { // إضافة تحقق من senderJid
+        if (!request || !request.status || !request.senderJid) { 
             console.warn(`[WITHDRAWAL_REQ_POLL_ALL] Invalid or incomplete request object for key ${key}:`, request);
-            delete pendingWithdrawals[key]; // حذف الطلب غير الصالح
+            delete pendingWithdrawals[key]; 
             savePendingWithdrawals();
             continue;
         }
-
-       
         
         request.lastPollTimestamp = Date.now();
+        activePollingNeeded = true; // A request is being processed, so polling is needed
 
-        activePollingNeeded = true; // افترض أننا نحتاج للـ polling طالما هناك طلبات
         switch (request.status) {
             case "pending_api_processing":
-                await pollForOtpReadyOrNotTransfer(request, key, localSock); // تمرير localSock
+                await pollForOtpReadyOrNotTransfer(request, key, localSock); 
                 break;
             case "awaiting_not_transfer_note":
-                await pollForNotTransferNote(request, key, localSock); // تمرير localSock
+                await pollForNotTransferNote(request, key, localSock); 
                 break;
-            case "awaiting_post_otp_note":
-                await pollForPostOtpNote(request, key, localSock); // تمرير localSock
+            case "awaiting_post_otp_note": 
+                await pollForPostOtpNote(request, key, localSock); 
                 break;
             case "awaiting_otp_confirmation":
-                activePollingNeeded = true; // لا يزال هناك طلب ينتظر المستخدم، لذا استمر في الـ polling العام للحالات الأخرى
+                // This state requires user input, but polling continues for other requests or state changes.
                 break; 
             case "otp_received_processing":
                 console.log(`[WITHDRAWAL_REQ_POLL_ALL] Request ${key} is processing OTP confirmation.`);
+                break;
             default:
                 console.warn(`[WITHDRAWAL_REQ_POLL_ALL] Unknown status for request ${key}: ${request.status}`);
-                activePollingNeeded = false; // إذا كانت الحالة غير معروفة، افترض أنها لا تحتاج لـ polling نشط
                 break;
         }
     }
     savePendingWithdrawals(); 
 
-    if (!activePollingNeeded && Object.keys(pendingWithdrawals).length === 0) { // تعديل: أوقف فقط إذا لم تكن هناك حاجة نشطة وكانت القائمة فارغة
-        console.log("[WITHDRAWAL_REQ_POLL_ALL] No active polling needed and no pending requests. Stopping polling.")
-        stopPolling();
-    } else if (!activePollingNeeded && Object.keys(pendingWithdrawals).every(k => pendingWithdrawals[k].status === "awaiting_otp_confirmation")) {
-        console.log("[WITHDRAWAL_REQ_POLL_ALL] All pending requests are awaiting OTP from user. Polling will continue for other potential states.");
-        // لا توقف الـ polling هنا، فقد تأتي طلبات جديدة أو تتغير حالات
-    } else if (Object.keys(pendingWithdrawals).length === 0) {
+    if (Object.keys(pendingWithdrawals).length === 0) {
         console.log("[WITHDRAWAL_REQ_POLL_ALL] All pending requests processed. Stopping polling.")
         stopPolling();
-    }
-    else {
+    } else {
         console.log(`[WITHDRAWAL_REQ_POLL_ALL] Polling cycle completed. Active requests: ${Object.keys(pendingWithdrawals).length}`);
+    }
+}
+
+async function getProcessedTransferDetails(apiTransferId) {
+    let apiToken = getApiToken();
+    if (!apiToken) {
+        apiToken = await loginToApi();
+        if (!apiToken) throw new Error("Failed to login to API for fetching processed transfer details.");
+    }
+    try {
+        // Corrected: Use PROCESSED_TRANSFERS_API_ENDPOINT which expects an array
+        const response = await fetch(`${PROCESSED_TRANSFERS_API_ENDPOINT}?id=${apiTransferId}`, {
+            method: 'GET',
+            headers: { 'Authorization': `Bearer ${apiToken}`, 'Accept': 'application/json' },
+            timeout: 15000, 
+        });
+        if (!response.ok) {
+            console.error(`[GET_PROCESSED_TRANSFER] API error for ID ${apiTransferId}: ${response.status}`);
+            return null;
+        }
+        const responseData = await response.json();
+        // Expects responseData.data to be an array for this endpoint
+        if (!responseData || !Array.isArray(responseData.data)) { 
+            console.error(`[GET_PROCESSED_TRANSFER] Invalid API response for ID ${apiTransferId}. Expected data array.`, responseData);
+            return null;
+        }
+        const item = responseData.data.find(d => d.id && d.id.toString() === apiTransferId.toString());
+        if (!item) {
+            console.log(`[GET_PROCESSED_TRANSFER] Transfer ID ${apiTransferId} not found in processed transfers list.`);
+            return null;
+        }
+        console.log(`[GET_PROCESSED_TRANSFER] Found processed transfer for ID ${apiTransferId}:`, item);
+        return item.transfer_details || null; 
+    } catch (error) {
+        console.error(`[GET_PROCESSED_TRANSFER] Error fetching processed transfer for ID ${apiTransferId}:`, error);
+        return null;
+    }
+}
+
+async function getPostOtpNote(apiTransferId) {
+    let apiToken = getApiToken();
+    if (!apiToken) {
+        apiToken = await loginToApi();
+        if (!apiToken) throw new Error("Failed to login to API for fetching post OTP notes.");
+    }
+    try {
+        const response = await fetch(`${POST_OTP_NOTE_API_ENDPOINT}/${apiTransferId}`, {
+            method: 'GET',
+            headers: { 'Authorization': `Bearer ${apiToken}`, 'Accept': 'application/json' },
+            timeout: 15000, 
+        });
+        if (!response.ok) {
+            console.error(`[GET_POST_OTP_NOTE] API error for ID ${apiTransferId}: ${response.status}`);
+            return null;
+        }
+        const responseData = await response.json();
+        // Corrected: Expects notes to be in responseData.data.notes based on provided log
+        if (!responseData || typeof responseData.data !== 'object') { 
+            console.error(`[GET_POST_OTP_NOTE] Invalid API response structure for ID ${apiTransferId}. Expected data object.`, responseData);
+            return null;
+        }
+        if (responseData.data.notes) {
+            console.log(`[GET_POST_OTP_NOTE] Found post OTP notes for ID ${apiTransferId}:`, responseData.data.notes);
+            return responseData.data.notes; 
+        } else {
+            console.log(`[GET_POST_OTP_NOTE] No post OTP notes field found in response.data for ID ${apiTransferId}. Response:`, responseData);
+            return null;
+        }
+    } catch (error) {
+        console.error(`[GET_POST_OTP_NOTE] Error fetching post OTP notes for ID ${apiTransferId}:`, error);
+        return null;
     }
 }
 
@@ -163,12 +226,12 @@ async function fetchWithToken(url, options = {}) {
     const defaultOptions = {
         method: 'GET',
         headers: { 'Authorization': `Bearer ${apiToken}`, 'Accept': 'application/json' },
-        timeout: 15000, // زيادة المهلة قليلاً
+        timeout: 15000, 
     };
     return fetch(url, { ...defaultOptions, ...options });
 }
 
-async function pollForOtpReadyOrNotTransfer(request, requestKey, sock) { // استقبال sock
+async function pollForOtpReadyOrNotTransfer(request, requestKey, sock) { 
     console.log(`[POLL_OTP_READY] Key: ${requestKey}, API_ID: ${request.apiTransferId}, OrigNum: ${request.originalTransferNumber}`);
     try {
         const response = await fetchWithToken(POLLING_OTP_READY_API_ENDPOINT);
@@ -186,7 +249,7 @@ async function pollForOtpReadyOrNotTransfer(request, requestKey, sock) { // اس
             (d.contact_id && d.contact_id.toString() === request.contactId.toString() && d.original_transfer_number && d.original_transfer_number.toString() === request.originalTransferNumber.toString())
         );
         if (!item) {
-            console.log(`[POLL_OTP_READY] Request ${requestKey} not found in "with-confirmation-code-unprocessed" list.`);
+            console.log(`[POLL_OTP_READY] Request ${requestKey} (ID: ${request.apiTransferId}, OrigNum: ${request.originalTransferNumber}) not found in "with-confirmation-code-unprocessed" list.`);
             return;
         }
         console.log(`[POLL_OTP_READY] Found item for ${requestKey}:`, item);
@@ -194,89 +257,113 @@ async function pollForOtpReadyOrNotTransfer(request, requestKey, sock) { // اس
             request.status = "awaiting_otp_confirmation";
             request.expectedOtp = item.confirmation_code.toString();
             request.transferDetails = item.transfer_details;
-            request.apiTransferId = item.id; // تحديث إذا لزم الأمر
+            request.apiTransferId = item.id; 
             const userMessage = `تفاصيل الحوالة:\n${item.transfer_details}\n\nرمز التأكيد (OTP) الخاص بك هو:\n\`\`\`${item.confirmation_code}\`\`\`\n\nالرجاء إعادة إرسال رمز التأكيد فقط لتأكيد عملية السحب.`;
-            // await sock.sendMessage(request.senderJid, { text: userMessage }); // استخدام sock.sendMessage
-        } else if (item.Note) {
-            // await sock.sendMessage(request.senderJid, { text: item.Note }); // استخدام sock.sendMessage
+            await sock.sendMessage(request.senderJid, { text: userMessage }); 
+        } else if (item.Note) { // Assuming this endpoint uses 'Note' for direct messages
+            await sock.sendMessage(request.senderJid, { text: item.Note }); 
             delete pendingWithdrawals[requestKey];
+        } else if (item.notes) { // Fallback check for 'notes' if 'Note' is not present
+             await sock.sendMessage(request.senderJid, { text: item.notes }); 
+             delete pendingWithdrawals[requestKey];
         } else if (item.status === 1 && !item.confirmation_code && !item.customer_confirmed) {
             request.status = "awaiting_not_transfer_note";
             request.apiTransferId = item.id;
-        } else { /* ... */ }
+        } else { 
+            console.log(`[POLL_OTP_READY] Item for ${requestKey} does not match expected conditions for OTP or Note. Item:`, item);
+        }
     } catch (error) {
         console.error(`[POLL_OTP_READY] Error polling for ${requestKey}:`, error);
     }
 }
 
-async function pollForNotTransferNote(request, requestKey, sock) { // استقبال sock
+async function pollForNotTransferNote(request, requestKey, sock) { 
     console.log(`[POLL_NOT_TRANSFER] Key: ${requestKey}, API_ID: ${request.apiTransferId}`);
-    if (!request.apiTransferId) { delete pendingWithdrawals[requestKey]; return; }
+    if (!request.apiTransferId) { 
+        console.warn(`[POLL_NOT_TRANSFER] apiTransferId missing for ${requestKey}. Removing.`);
+        delete pendingWithdrawals[requestKey]; 
+        return; 
+    }
     try {
         const response = await fetchWithToken(`${NOT_TRANSFERS_API_ENDPOINT}?id=${request.apiTransferId}`);
         if (!response.ok) {
             if (response.status === 404) {
-                // await sock.sendMessage(request.senderJid, { text: `تعذر العثور على تفاصيل الطلب ${request.originalTransferNumber} (NT404).`});
+                await sock.sendMessage(request.senderJid, { text: `تعذر العثور على تفاصيل الطلب ${request.originalTransferNumber} (NT404).`});
                 delete pendingWithdrawals[requestKey];
+            } else {
+                console.error(`[POLL_NOT_TRANSFER] API error for ${requestKey}: ${response.status}`);
             }
             return;
         }
         const responseData = await response.json();
-        const item = Array.isArray(responseData.data) ? responseData.data.find(d => d.id && d.id.toString() === request.apiTransferId.toString()) : 
-                     (responseData.id && responseData.id.toString() === request.apiTransferId.toString() ? responseData : null);
-        if (item && item.Note) {
-            // await sock.sendMessage(request.senderJid, { text: item.Note }); // استخدام sock.sendMessage
+        // This endpoint might return a single object or an array with one item if queried by ID.
+        // The original code handled both if responseData itself was the item or if it was in responseData.data[0]
+        let item = null;
+        if (Array.isArray(responseData.data) && responseData.data.length > 0) {
+            item = responseData.data.find(d => d.id && d.id.toString() === request.apiTransferId.toString());
+        } else if (responseData.id && responseData.id.toString() === request.apiTransferId.toString()) {
+            item = responseData; // If responseData is the item itself
+        } else if (responseData.data && responseData.data.id && responseData.data.id.toString() === request.apiTransferId.toString()) {
+            item = responseData.data; // If item is nested under 'data' as an object
+        }
+
+
+        if (item && item.Note) { // Assuming this endpoint uses 'Note'
+            await sock.sendMessage(request.senderJid, { text: item.Note }); 
             delete pendingWithdrawals[requestKey];
-        } else { /* ... */ }
+        } else if (item && item.notes) { // Fallback for 'notes'
+            await sock.sendMessage(request.senderJid, { text: item.notes }); 
+            delete pendingWithdrawals[requestKey];
+        } else if (item) {
+            console.log(`[POLL_NOT_TRANSFER] Item found for ${requestKey} but no Note/notes. Item:`, item);
+        } else {
+             console.log(`[POLL_NOT_TRANSFER] No item/notes found for ${requestKey} with ID ${request.apiTransferId}. Response:`, responseData);
+        }
     } catch (error) { console.error(`[POLL_NOT_TRANSFER] Error for ${requestKey}:`, error); }
 }
 
-async function pollForPostOtpNote(request, requestKey, sock) { // استقبال sock
-    console.log(`[POLL_POST_OTP] Key: ${requestKey}, API_ID: ${request.apiTransferId}`);
-    if (!request.apiTransferId) { delete pendingWithdrawals[requestKey]; return; }
+async function pollForPostOtpNote(request, requestKey, sock) { 
+    console.log(`[POLL_POST_OTP_NOTE] Key: ${requestKey}, API_ID: ${request.apiTransferId}`);
+    if (!request.apiTransferId) { 
+        console.warn(`[POLL_POST_OTP_NOTE] apiTransferId missing for ${requestKey}. Removing.`);
+        delete pendingWithdrawals[requestKey]; 
+        return; 
+    }
     try {
-        const response = await fetchWithToken(`${CONFIRM_WITHDRAWAL_API_ENDPOINT_BASE}/${request.apiTransferId}`);
-        if (!response.ok) {
-            if (response.status === 404) {
-                //  await sock.sendMessage(request.senderJid, { text: `تعذر العثور على تفاصيل إتمام الطلب ${request.originalTransferNumber} (PO404).`});
-                 delete pendingWithdrawals[requestKey];
+        const notes = await getPostOtpNote(request.apiTransferId); // Fetches from /successful/{id}
+        if (notes) {
+            await sock.sendMessage(request.senderJid, { text: notes }); 
+            
+            const transferDetails = await getProcessedTransferDetails(request.apiTransferId); // Fetches from /success-transfers?id={id}
+            if (transferDetails) {
+                await sock.sendMessage(request.senderJid, { text: `تفاصيل الحوالة بعد التأكيد:\n${transferDetails}` });
+            } else {
+                console.log(`[POLL_POST_OTP_NOTE] No additional transfer details found via getProcessedTransferDetails for ${requestKey}.`);
             }
-            return;
+            delete pendingWithdrawals[requestKey]; 
+        } else {
+            console.log(`[POLL_POST_OTP_NOTE] No post OTP notes found yet for ${requestKey}. Will retry.`);
         }
-        const item = await response.json();
-        if (!item || typeof item !== 'object') return;
-        if (item.Note && (item.customer_confirmed === true || item.status === 2 || item.status === "Completed")) {
-            // await sock.sendMessage(request.senderJid, { text: item.Note }); // استخدام sock.sendMessage
-            delete pendingWithdrawals[requestKey];
-        } else if (item.Note) { 
-            // await sock.sendMessage(request.senderJid, { text: item.Note }); // استخدام sock.sendMessage
-            request.status = "awaiting_post_otp_note"; // تحديث الحالة للانتظار لملاحظة ما بعد OTP
-            request.expectedOtp = null; // مسح رمز OTP المتوقع
-            request.transferDetails = item.transfer_details || null; // حفظ تفاصيل الحوالة إذا كانت موجودة
-            request.lastPollTimestamp = Date.now(); // تحديث الطابع الزمني الأخير
-            savePendingWithdrawals(); // حفظ التغييرات
-        }
-        else { 
-
-            console.warn(`[POLL_POST_OTP] No Note found for request ${requestKey}.`);
-            request.status = "awaiting_post_otp_note"; // تحديث الحالة للانتظار لملاحظة ما بعد OTP
-            request.expectedOtp = null; // مسح رمز OTP المتوقع
-            request.transferDetails = item.transfer_details || null; // حفظ تفاصيل الحوالة إذا كانت موجودة
-            request.lastPollTimestamp = Date.now(); // تحديث الطابع الزمني الأخير
-            savePendingWithdrawals(); // حفظ التغييرات
-        }
-    } catch (error) { console.error(`[POLL_POST_OTP] Error for ${requestKey}:`, error); }
+    } catch (error) {
+        console.error(`[POLL_POST_OTP_NOTE] Error for ${requestKey}:`, error);
+    }
 }
 
 async function handleWithdrawalRequest(m, sender, originalTransferNumber, isOwner) {
     console.log(`[WITHDRAWAL_REQ] Request from ${sender} for transfer: ${originalTransferNumber}`);
-    if (!isOwner && !isWhitelisted(sender)) { m.reply("عذراً، لا يمكنك استخدام هذا الأمر."); return; }
+    if (!isOwner && !isWhitelisted(sender)) { 
+         m.reply("عذراً، لا يمكنك استخدام هذا الأمر."); 
+        return; }
     const senderInfo = global.userGroupPermissions?.[sender];
-    if (!senderInfo || (senderInfo.contact_id === undefined || senderInfo.contact_id === null)) { m.reply("عفواً، معلومات حسابك غير مكتملة (CI)."); return; }
+    if (!senderInfo || (senderInfo.contact_id === undefined || senderInfo.contact_id === null)) { 
+         m.reply("عفواً، معلومات حسابك غير مكتملة (CI).");
+         return; }
     const contactId = senderInfo.contact_id;
     let apiToken = getApiToken();
     if (!apiToken) apiToken = await loginToApi();
-    if (!apiToken) { m.reply("خطأ اتصال (T1)."); return; }
+    if (!apiToken) { 
+         m.reply("خطأ اتصال (T1)."); return;
+     }
 
     const payload = { contact_id: contactId, customer_request: "سحب", original_transfer_number: originalTransferNumber };
     try {
@@ -288,7 +375,7 @@ async function handleWithdrawalRequest(m, sender, originalTransferNumber, isOwne
         });
         const responseData = await response.json().catch(() => null);
         if (response.ok && responseData) {
-            m.reply(`تم استلام طلب السحب (${originalTransferNumber}). جاري المعالجة...`);
+             m.reply(`تم استلام طلب السحب (${originalTransferNumber}). جاري المعالجة...`);
             const requestKey = `${sender}_${originalTransferNumber}_${Date.now()}`;
             pendingWithdrawals[requestKey] = {
                 senderJid: sender, originalTransferNumber: originalTransferNumber.toString(), contactId: contactId.toString(),
@@ -297,65 +384,105 @@ async function handleWithdrawalRequest(m, sender, originalTransferNumber, isOwne
             };
             savePendingWithdrawals(); startPolling();
         } else { 
-            const errorMsg = responseData?.message || responseData?.Note || `فشل إرسال الطلب الأولي (Status: ${response.status})`;
+            const errorMsg = responseData?.message || responseData?.Note || responseData?.notes || `فشل إرسال الطلب الأولي (Status: ${response.status})`;
             console.error(`[WITHDRAWAL_REQ_ERROR] Initial request failed: ${response.status}`, responseData);
-            m.reply(`خطأ: ${errorMsg}`);
+             m.reply(`خطأ: ${errorMsg}`);
         }
     } catch (error) {
         console.error(`[WITHDRAWAL_REQ_ERROR] Sending initial request:`, error);
-        m.reply("خطأ غير متوقع أثناء إرسال طلب السحب.");
+         m.reply("خطأ غير متوقع أثناء إرسال طلب السحب.");
     }
 }
 
 async function handleOtpConfirmation(m, sender, receivedOtp) {
     console.log(`[OTP_CONFIRM] OTP attempt: ${receivedOtp} from ${sender}.`);
-    const pendingRequestKey = Object.keys(pendingWithdrawals).find(key => 
-        pendingWithdrawals[key].senderJid === sender && 
+    const pendingRequestKey = Object.keys(pendingWithdrawals).find(key =>
+        pendingWithdrawals[key].senderJid === sender &&
         pendingWithdrawals[key].status === "awaiting_otp_confirmation"
     );
-    if (!pendingRequestKey || !pendingWithdrawals[pendingRequestKey]) { m.reply("لا يوجد طلب سحب نشط ينتظر رمز تأكيد منك."); return; }
+
+    if (!pendingRequestKey || !pendingWithdrawals[pendingRequestKey]) {
+        m.reply("لا يوجد طلب سحب نشط ينتظر رمز تأكيد منك.");
+        return;
+    }
+
     const pendingRequest = pendingWithdrawals[pendingRequestKey];
-    const receivedOtpCleaned = receivedOtp.trim();
+    const receivedOtpCleaned = receivedOtp.trim(); 
+
+    console.log(`[OTP_VALIDATION] Sender: ${sender}`);
+    console.log(`[OTP_VALIDATION] Pending Request Key: ${pendingRequestKey}`);
+    console.log(`[OTP_VALIDATION] Pending Request Status: ${pendingRequest.status}`);
+    console.log(`[OTP_VALIDATION] Pending Request API ID: ${pendingRequest.apiTransferId}`);
+    console.log(`[OTP_VALIDATION] Expected OTP from pendingRequest: '${pendingRequest.expectedOtp}' (Type: ${typeof pendingRequest.expectedOtp})`);
+    console.log(`[OTP_VALIDATION] Received OTP (raw from regex match): '${receivedOtp}' (Type: ${typeof receivedOtp})`);
+    console.log(`[OTP_VALIDATION] Received OTP (cleaned): '${receivedOtpCleaned}' (Type: ${typeof receivedOtpCleaned})`);
 
     if (pendingRequest.expectedOtp && pendingRequest.expectedOtp.toString() === receivedOtpCleaned) {
-        pendingRequest.status = "otp_received_processing"; savePendingWithdrawals();
-        const confirmed = await confirmOtpWithApi(pendingRequest, m, localSock); // تمرير localSock
+        console.log("[OTP_VALIDATION] OTPs MATCHED.");
+        pendingRequest.status = "otp_received_processing"; 
+        savePendingWithdrawals(); 
+
+        const confirmed = await confirmOtpWithApi(pendingRequest, m, localSock);
+
         if (confirmed) {
             pendingRequest.status = "awaiting_post_otp_note";
-            pendingRequest.lastPollTimestamp = Date.now(); savePendingWithdrawals(); startPolling();
-            m.reply("تم تأكيد الرمز. جاري الحصول على الحالة النهائية...");
+            pendingRequest.lastPollTimestamp = Date.now(); 
+            savePendingWithdrawals();
+            startPolling(); 
+            m.reply("تم تأكيد الرمز بنجاح. جاري الحصول على الحالة النهائية للطلب...");
         } else {
-            pendingRequest.status = "awaiting_otp_confirmation"; savePendingWithdrawals();
+            pendingRequest.status = "awaiting_otp_confirmation"; 
+            savePendingWithdrawals();
         }
-    } else { m.reply(`رمز التأكيد (${receivedOtpCleaned}) غير صحيح. حاول مرة أخرى.`); }
+    } else {
+        console.log("[OTP_VALIDATION] OTPs DID NOT MATCH.");
+        console.log(`[OTP_VALIDATION_MISMATCH] Reason: Expected OTP ('${pendingRequest.expectedOtp}') did not match Received OTP ('${receivedOtpCleaned}'). Or expectedOtp was falsy.`);
+        m.reply(`رمز التأكيد (${receivedOtpCleaned}) غير صحيح. حاول مرة أخرى.`);
+    }
 }
 
-async function confirmOtpWithApi(pendingRequest, m, sock) { // استقبال sock
+async function confirmOtpWithApi(pendingRequest, m, sock) { 
     let apiToken = getApiToken();
-    if (!apiToken) apiToken = await loginToApi();
-    if (!apiToken) { m.reply("خطأ اتصال (T2C)."); return false; }
+    if (!apiToken) {
+        apiToken = await loginToApi();
+    }
+    if (!apiToken) {
+        m.reply("خطأ اتصال (T2C).");
+        return false;
+    }
+
     const confirmPayload = { customer_confirmed: true };
+
     try {
         const response = await fetch(`${CONFIRM_WITHDRAWAL_API_ENDPOINT_BASE}/${pendingRequest.apiTransferId}`, {
             method: 'PUT',
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiToken}` },
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiToken}`
+            },
             body: JSON.stringify(confirmPayload),
             timeout: 20000,
         });
 
         if (response.ok) {
             console.log(`[CONFIRM_OTP] API OTP confirm success for ID ${pendingRequest.apiTransferId}.`);
-            const responseData = await response.json();
-            if (responseData && responseData.Note) {
-                // await sock.sendMessage(pendingRequest.senderJid, { text: responseData.Note }); // استخدام sock.sendMessage
-            } else {
-                // await sock.sendMessage(pendingRequest.senderJid, { text: "تم تأكيد الرمز بنجاح، ولكن لم يتم توفير ملاحظة إضافية." });
+            const responseData = await response.json().catch(() => null);
+
+            if (responseData && responseData.message) {
+                await sock.sendMessage(pendingRequest.senderJid, { text: responseData.message });
             }
             return true;
         } else {
-            const errorText = await response.text();
-            console.error(`[CONFIRM_OTP_ERROR] API OTP confirm failed: ${response.status} - ${errorText.substring(0,300)}`);
-            m.reply("خطأ أثناء تأكيد الرمز مع النظام. حاول مرة أخرى أو تواصل مع الدعم.");
+            let apiMessage = `فشل تأكيد الرمز مع الخادم (الحالة: ${response.status})`;
+            try {
+                const errorText = await response.text();
+                const responseData = JSON.parse(errorText || "{}"); 
+                apiMessage = responseData.message || responseData.Note || responseData.notes || apiMessage;
+                console.error(`[CONFIRM_OTP_ERROR] API OTP confirm failed: ${response.status} - ${errorText.substring(0,300)}`);
+            } catch (e) {
+                 console.error(`[CONFIRM_OTP_ERROR] API OTP confirm failed: ${response.status} and error parsing response body:`, e);
+            }
+            m.reply(`خطأ أثناء تأكيد الرمز: ${apiMessage}. حاول مرة أخرى أو تواصل مع الدعم.`);
             return false;
         }
     } catch (error) {
@@ -369,14 +496,31 @@ function cleanupOldStaleRequests() {
     const now = Date.now();
     const staleKeys = Object.keys(pendingWithdrawals).filter(key => {
         const request = pendingWithdrawals[key];
-        return request && request.status === "awaiting_otp_confirmation" && (now - request.lastPollTimestamp > 3 * 60 * 60 * 1000); // 3 ساعات
+        const requestTimestamp = request.lastPollTimestamp || request.requestTimestamp || now; // Ensure there's a timestamp
+        
+        const isAwaitingOtpTooLong = request && request.status === "awaiting_otp_confirmation" && (now - requestTimestamp > 3 * 60 * 60 * 1000); // 3 hours for OTP
+        const isProcessingTooLong = request && 
+                                    (request.status === "pending_api_processing" || 
+                                     request.status === "awaiting_not_transfer_note" ||
+                                     request.status === "awaiting_post_otp_note" ||
+                                     request.status === "otp_received_processing") && 
+                                    (now - requestTimestamp > 1 * 60 * 60 * 1000); // 1 hour for other processing states
+
+        return isAwaitingOtpTooLong || isProcessingTooLong;
     });
     if (staleKeys.length > 0) {
         staleKeys.forEach(key => {
-            console.log(`[WITHDRAWAL_REQ_CLEANUP] Removing stale request: ${key}`);
+            const request = pendingWithdrawals[key];
+            console.log(`[WITHDRAWAL_REQ_CLEANUP] Removing stale request: ${key} with status ${request.status}`);
+            if (localSock && request.senderJid) {
+                localSock.sendMessage(request.senderJid, { text: `تم إلغاء طلب السحب الخاص بك (${request.originalTransferNumber}) تلقائيًا بسبب انتهاء المهلة.` }).catch(e => console.error("Error sending stale notification", e));
+            }
             delete pendingWithdrawals[key];
         });
         savePendingWithdrawals();
+        if (Object.keys(pendingWithdrawals).length === 0) {
+            stopPolling(); 
+        }
     }
 }
 
@@ -402,7 +546,9 @@ module.exports = {
             await handleOtpConfirmation(m, sender, receivedOtp);
             return {};
         }
-        if (Math.random() < 0.01) cleanupOldStaleRequests();
+        if (Math.random() < 0.05) { 
+             cleanupOldStaleRequests();
+        }
         return;
     },
     stopPollingOnShutdown: stopPolling,
