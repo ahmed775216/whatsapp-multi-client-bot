@@ -37,10 +37,26 @@ function getClientDataPath(clientId) {
 function launchClientInstance(clientId, phoneNumberForContext, forceNewScan = false, apiUsername = null, apiPassword = null, ownerNumber = null) {
     ensureClientDataDirExists();
 
+    // Check if this is a linking client and if another linking is already in progress
+    const isNewLinking = phoneNumberForContext === 'new_linking_num' || clientId.startsWith('client_new_linking_');
+    if (isNewLinking) {
+        // Check if there's already an active linking instance
+        const activeLinkingInstances = Object.values(ACTIVE_BOT_INSTANCES).filter(inst => 
+            inst.isLinkingClient && inst.process && !inst.process.killed
+        );
+        
+        if (activeLinkingInstances.length > 0) {
+            console.warn(`[INST_MGR] A linking process is already active (${activeLinkingInstances[0].clientId}). Aborting new launch.`);
+            // Notify the UI about the existing linking process
+            qrWebSocketServerModule.notifyInstanceStatusChange(clientId, 'error', null, null);
+            qrWebSocketServerModule.updateManagerQrState('error', 'A linking process is already in progress. Please complete or cancel it first.', null, clientId, null, null, true);
+            return null;
+        }
+    }
+
     const clientDataPath = getClientDataPath(clientId);
     const authDir = path.join(clientDataPath, 'auth_info_baileys');
     const dataDir = path.join(clientDataPath, 'data');
-
     if (forceNewScan && fs.existsSync(authDir)) {
         try {
             fs.rmSync(authDir, { recursive: true, force: true });
