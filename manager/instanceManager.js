@@ -3,14 +3,17 @@ const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const WebSocket = require('ws'); // Required for sendInternalCommandToClient
-
+const { encryptPassword } = require('../database/utils');
 const config = require('../config');
+let process = require('process');
 // يجب استيراد وحدات qrWebSocketServer بدون destructuring لتجنب المشاكل مع الاستيراد الدائري المحتمل أو ترتيب التحميل
 const qrWebSocketServerModule = require('./qrWebSocketServer');
 
 const ACTIVE_BOT_INSTANCES = {};
 const INSTANCE_LOG_BUFFERS = {};
 const MAX_LOG_LINES = 100;
+const db = require('../database/db');
+
 
 function ensureClientDataDirExists() {
     if (!fs.existsSync(config.CLIENT_DATA_BASE_DIR)) {
@@ -20,7 +23,7 @@ function ensureClientDataDirExists() {
 }
 
 function generateClientId(phoneNumberOrContext) {
-if (phoneNumberOrContext === 'new_linking_num' || !phoneNumberOrContext || phoneNumberOrContext.trim() === '') {
+    if (phoneNumberOrContext === 'new_linking_num' || !phoneNumberOrContext || phoneNumberOrContext.trim() === '') {
         return `client_new_linking_${Date.now()}`;
     }
     const cleanPhone = phoneNumberOrContext.toString().replace(/\D/g, '');
@@ -34,7 +37,7 @@ function getClientDataPath(clientId) {
     return path.join(config.CLIENT_DATA_BASE_DIR, clientId);
 }
 
-function launchClientInstance(clientId, phoneNumberForContext, forceNewScan = false, apiUsername = null, apiPassword = null, ownerNumber = null) {
+async function launchClientInstance(clientId, phoneNumberForContext, forceNewScan = false, apiUsername = null, apiPassword = null, ownerNumber = null) {
     ensureClientDataDirExists();
 
     // Check if this is a linking client and if another linking is already in progress
@@ -152,6 +155,19 @@ function launchClientInstance(clientId, phoneNumberForContext, forceNewScan = fa
              qrWebSocketServerModule.updateManagerQrState('error', `Failed to start QR process for ${clientId}: ${err.message}`, null, clientId, null, null, true);
         }
     });
+    try {
+        await db.query(`
+            INSERT INTO bot_instances (client_id, phone_number, api_username, api_password_encrypted, owner_number, status)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (client_id) 
+            DO UPDATE SET 
+                status = $6,
+                last_seen = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+        `, [clientId, phoneNumberForContext, apiUsername, encryptPassword(apiPassword), ownerNumber, 'starting']);
+    } catch (err) {
+        console.error(`[DB_ERROR] Failed to save bot instance: ${err.message}`);
+    }
     return child;
 }
 
@@ -166,7 +182,9 @@ function stopClientInstance(clientId, isRestarting = false) { // إضافة مع
         if (instance.terminateTimeout) clearTimeout(instance.terminateTimeout);
         
         if (instance.process.connected) {
-            try { instance.process.disconnect(); } catch (e) { /* ... */ }
+            try { instance.process.disconnect(); } catch (e) { 
+                console.error(`[INST_MGR_ERROR] Failed to disconnect process for ${clientId}:`, e);
+            }
         }
         instance.process.kill('SIGTERM');
         instance.terminateTimeout = setTimeout(() => {
@@ -273,7 +291,9 @@ function recoverExistingClientInstances() {
                 recoveredApiPassword = clientConfigData.apiPassword;
                 recoveredOwnerNumber = clientConfigData.ownerNumber;
                 recoveredPhoneNumber = clientConfigData.phoneNumber || recoveredPhoneNumber; 
-            } catch (e) { /* ... */ }
+            } catch (e) { 
+                console.error(`[INST_MGR_ERROR] Failed to read client config for ${folderName}:`, e);
+            }
         }
         if (fs.existsSync(clientAuthPath) && fs.readdirSync(clientAuthPath).length > 0) {
             console.log(`[INST_MGR] Found session for ${folderName} (Phone: ${recoveredPhoneNumber}). Launching.`);
@@ -283,23 +303,6 @@ function recoverExistingClientInstances() {
     }
 }
 
-function handleClientBotQrUpdate(clientId, qr) { // هذا يستقبل سلسلة QR مباشرة
-    const instance = ACTIVE_BOT_INSTANCES[clientId];
-    if (instance) {
-        console.log(`[INST_MGR] Received QR for ${clientId}. Updating status and QR state.`);
-        instance.status = 'qr_received'; // تحديث الحالة هنا
-        instance.lastUpdated = Date.now();
-        instance.lastKnownQR = qr;
-        qrWebSocketServerModule.notifyInstanceStatusChange(clientId, instance.status, instance.phoneNumber, instance.name);
-        
-        const isCurrentlyLinkingOnUI = clientId === qrWebSocketServerModule.managerQrState?.linkingClientId;
-        if (instance.isLinkingClient || isCurrentlyLinkingOnUI) {
-            qrWebSocketServerModule.updateManagerQrState('qr', 'Scan the QR code with WhatsApp.', qr, clientId, null, null, true);
-        }
-    } else {
-        console.warn(`[INST_MGR] Received QR update for unknown client ID: ${clientId}`);
-    }
-}
 
 
 function listInstances() {

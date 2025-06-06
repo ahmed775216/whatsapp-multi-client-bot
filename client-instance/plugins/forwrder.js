@@ -2,13 +2,22 @@
 const fetch = require('node-fetch');
 const { v4: uuidv4 } = require('uuid');
 const { isWhitelisted } = require('./whitelist');
-const { getApiToken, stripCountryCode } = require('../lib/apiSync');
+const { getApiToken } = require('../lib/apiSync');
 const config = require('../../config');
-
+let process = require('process');
 const API_BASE_URL = process.env.API_BASE_URL;
 const RAW_NOTIFICATION_API_PATH = '/raw-notifications';
 const RAW_NOTIFICATION_API_ENDPOINT = `${API_BASE_URL}${RAW_NOTIFICATION_API_PATH}`;
 
+// Add this function in forwarder.js
+function stripCountryCode(fullNumber, countryCode = '967') {
+    if (!fullNumber) return '';
+    const numberPart = fullNumber.toString().replace(/[^0-9]/g, '');
+    if (numberPart.startsWith(countryCode)) {
+        return numberPart.substring(countryCode.length);
+    }
+    return numberPart;
+}
 function generateSourcePackageName() {
     const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
     let result = '';
@@ -87,10 +96,14 @@ module.exports = {
                 },
                 body: JSON.stringify(payload),
             });
-
             if (response.ok) {
-                // ... (نفس معالجة الاستجابة)
-                console.log(`[${process.env.CLIENT_ID}_FORWARDER-API] Successfully sent raw notification. Status: ${response.status}`);
+                // إذا كانت الاستجابة ناجحة، يمكنك معالجة البيانات إذا لزم الأمر
+                const responseData = await response.json();
+                // showw the response data in the console for debugging
+                console.log(`[${process.env.CLIENT_ID}_FORWARDER-API] Successfully sent raw notification. Response:${response.status}`, responseData);
+
+
+                // console.log(`[${process.env.CLIENT_ID}_FORWARDER-API] Successfully sent raw notification. Status: `);
             } else {
                 const errorText = await response.text();
                 console.error(`[${process.env.CLIENT_ID}_FORWARDER-API] Failed to send raw notification. Status: ${response.status}. Response: ${errorText}`);

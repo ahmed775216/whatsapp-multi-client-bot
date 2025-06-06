@@ -1,7 +1,8 @@
 // config.js
 const path = require('path');
 require('dotenv').config(); // Load .env for config variables
-
+let process = require('process');
+// const __dirname = path.dirname(path.resolve()); // Get the root directory of the project
 const ROOT_DIR = __dirname; // Current directory (whatsapp-multi-client-bot)
 const CLIENT_DATA_BASE_DIR = path.join(ROOT_DIR, 'client_data'); // Base directory for all client data
 

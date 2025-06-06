@@ -1,8 +1,8 @@
 // manager/manager.js
 const path = require('path');
-const fs = require('fs');
+// const fs = require('fs');
 require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
-
+let process = require('process');
 const config = require('../config');
 const qrWebSocketServer = require('./qrWebSocketServer');
 const instanceManager = require('./instanceManager');
@@ -10,23 +10,55 @@ const instanceManager = require('./instanceManager');
 console.log('--- Starting WhatsApp Bot Manager ---');
 console.log(`[MANAGER_CONFIG] API_BASE_URL: ${config.API_BASE_URL}`);
 console.log(`[MANAGER_CONFIG] QR_WEBSOCKET_PORT: ${config.QR_WEBSOCKET_PORT}`);
+// ADDED: Generic internal command handler for manager
+function handleInternalCommandFromUi(clientId, commandPayload) {
+    console.log(`[MANAGER] Received internal command from UI for client ${clientId}: ${commandPayload.command}`);
+    instanceManager.sendInternalCommandToClient(clientId, commandPayload);
+}
 
+// manager/manager.js - Add better cleanup handling
 function handleQrRequest(apiUsername, apiPassword, ownerNumber) {
-    // Log the request
-    console.log(`[MANAGER] QR request received - API User: ${apiUsername}, Owner: ${ownerNumber}`);
+    console.log(`[MANAGER_DEBUG] handleQrRequest called - API User: ${apiUsername}, Owner: ${ownerNumber}`);
     
-    // Check if there's already an active linking process
-    const activeLinkingInstances = Object.values(instanceManager.ACTIVE_BOT_INSTANCES).filter(inst => 
-        inst.isLinkingClient && inst.process && !inst.process.killed
-    );
+    // Check and clean up dead temporary instances first
+    const deadTempInstances = Object.values(instanceManager.ACTIVE_BOT_INSTANCES)
+        .filter(inst => inst.clientId.startsWith('client_new_linking_') && 
+                (!inst.process || inst.process.killed || inst.status === 'exited'));
+    
+    console.log(`[MANAGER_DEBUG] Found ${deadTempInstances.length} dead temporary instances to clean up`);
+    
+    deadTempInstances.forEach(inst => {
+        console.log(`[MANAGER_DEBUG] Cleaning up dead instance: ${inst.clientId}`);
+        delete instanceManager.ACTIVE_BOT_INSTANCES[inst.clientId];
+    });
+    
+    // Check for active linking processes
+    const activeLinkingInstances = Object.values(instanceManager.ACTIVE_BOT_INSTANCES)
+        .filter(inst => inst.isLinkingClient && inst.process && !inst.process.killed);
+    
+    console.log(`[MANAGER_DEBUG] Active linking instances: ${activeLinkingInstances.length}`);
     
     if (activeLinkingInstances.length > 0) {
-        console.warn(`[MANAGER] Linking already in progress with ${activeLinkingInstances[0].clientId}`);
+        const activeInstance = activeLinkingInstances[0];
+        console.warn(`[MANAGER] Linking already in progress with ${activeInstance.clientId} (Status: ${activeInstance.status})`);
+        
+        // If the instance is stuck, kill it
+        if (activeInstance.status === 'qr_received' || activeInstance.status === 'disconnected_whatsapp') {
+            console.log(`[MANAGER] Killing stuck linking instance ${activeInstance.clientId}`);
+            instanceManager.stopClientInstance(activeInstance.clientId);
+            
+            // Wait a bit then proceed
+            setTimeout(() => {
+                handleQrRequest(apiUsername, apiPassword, ownerNumber);
+            }, 2000);
+            return;
+        }
+        
         qrWebSocketServer.updateManagerQrState(
             'error', 
             'A linking process is already in progress. Please complete or cancel it first.', 
             null, 
-            activeLinkingInstances[0].clientId, 
+            activeInstance.clientId, 
             null, 
             null, 
             true
@@ -35,20 +67,14 @@ function handleQrRequest(apiUsername, apiPassword, ownerNumber) {
     }
 
     const linkingClientId = instanceManager.generateClientId('new_linking_num');
-    console.log(`[MANAGER] UI requested QR. Launching temporary client: ${linkingClientId}`);
+    console.log(`[MANAGER] Creating new linking instance: ${linkingClientId}`);
     
-    // Send initial status
     qrWebSocketServer.updateManagerQrState(
         'linking_in_progress', 
         'Generating QR code for new WhatsApp link...', 
-        null, 
-        linkingClientId, 
-        null, 
-        null, 
-        true
+        null, linkingClientId, null, null, true
     );
     
-    // Launch the instance
     const childProcess = instanceManager.launchClientInstance(
         linkingClientId, 
         'new_linking_num', 
@@ -69,6 +95,8 @@ function handleQrRequest(apiUsername, apiPassword, ownerNumber) {
             null, 
             true
         );
+    } else {
+        console.log(`[MANAGER] Successfully launched linking instance ${linkingClientId}`);
     }
 }
 
@@ -121,6 +149,8 @@ const wsCallbacks = {
         const logs = instanceManager.getInstanceLogs(clientId);
         qrWebSocketServer.sendToClient(ws, { type: 'instanceLogs', clientId: clientId, logs: logs });
     },
+    // onFetchGroups: (clientId, commandPayload) => handleInternalCommandFromUi(clientId, commandPayload), // This now handles all internal commands
+
     onFetchGroups: (clientId) => {
         instanceManager.sendInternalCommandToClient(clientId, { command: 'fetchGroups' });
     },
@@ -138,6 +168,14 @@ const wsCallbacks = {
     },
     onFetchParticipants: (clientId, groupId) => {
         instanceManager.sendInternalCommandToClient(clientId, { command: 'fetchParticipants', groupId: groupId });
+    },
+    // ADDED: Handler for manualLidEntry command from UI
+    onManualLidEntry: (clientId, commandPayload) => {
+        // Assuming commandPayload from UI is an object like: { lid: '...', phoneJid: '...' }
+        // We will forward this directly to the client instance.
+        // The client instance's internal command handler will need to be updated
+        // to process a command like { command: 'manualLidEntry', lid: '...', phoneJid: '...' }
+        handleInternalCommandFromUi(clientId, { command: 'manualLidEntry', ...commandPayload });
     }
 };
 

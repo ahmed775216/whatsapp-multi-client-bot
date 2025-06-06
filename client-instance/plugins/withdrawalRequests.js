@@ -5,7 +5,7 @@ const { isWhitelisted } = require('./whitelist');
 const config = require('../../config');
 const fs = require('fs');
 const path = require('path');
-
+let process = require('process');
 let localSock = null;
 const DATA_BASE_DIR = process.env.DATA_DIR;
 const PENDING_WITHDRAWALS_FILE = DATA_BASE_DIR ? path.join(DATA_BASE_DIR, 'pending_withdrawals.json') : 'pending_withdrawals.json';
@@ -262,7 +262,7 @@ function init(sockInstance) {
         pendingWithdrawals = loadPendingWithdrawals();
         if (Object.keys(pendingWithdrawals).length > 0) {
             console.log('[WITHDRAWAL_REQ_INIT] Found pending requests on startup. Starting polling cycle.');
-            startPolling();
+            // startPolling();
         }
     } else {
         console.error('[WITHDRAWAL_REQ_INIT_ERROR] sockInstance is null or undefined. Plugin cannot function.');
@@ -578,7 +578,8 @@ async function handleWithdrawalRequest(m, sender, originalTransferNumber, isOwne
                 status: "pending_api_processing", apiTransferId: responseData.id || null,
                 requestTimestamp: Date.now(), lastPollTimestamp: Date.now()
             };
-            savePendingWithdrawals(); startPolling();
+            savePendingWithdrawals(); 
+            // startPolling();
         } else { 
             const errorMsg = responseData?.message || responseData?.Note || responseData?.notes || `فشل إرسال الطلب الأولي (Status: ${response.status})`;
             console.error(`[WITHDRAWAL_REQ_ERROR] Initial request failed: ${response.status}`, responseData);
@@ -624,7 +625,7 @@ async function handleOtpConfirmation(m, sender, receivedOtp) {
             pendingRequest.status = "awaiting_post_otp_note";
             pendingRequest.lastPollTimestamp = Date.now(); 
             savePendingWithdrawals();
-            startPolling(); 
+            // startPolling(); 
             m.reply("تم تأكيد الرمز بنجاح. جاري الحصول على الحالة النهائية للطلب...");
         } else {
             pendingRequest.status = "awaiting_otp_confirmation"; 

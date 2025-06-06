@@ -5,7 +5,7 @@
 // استيراد الدوال الجديدة من whitelist.js
 const { isWhitelisted, getAskedLidsCache, saveAskedLidsFile, getPendingLidIdentifications, savePendingIdsFile } = require('./whitelist');
 const { jidNormalizedUser } = require('@whiskeysockets/baileys'); // تأكد من استيراد jidNormalizedUser
-
+let process = require('process');
 const ASK_LID_COOLDOWN_MS = 5 * 60 * 1000; // 5 دقائق قبل إعادة سؤال نفس @lid
 
 
