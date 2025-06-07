@@ -8,7 +8,7 @@ let process = require('process');
 function encryptPassword(password) {
     // For now, using simple encryption - should match your security requirements
     const algorithm = 'aes-256-cbc';
-    const key = crypto.scryptSync(process.env.ENCRYPTION_KEY || 'default-key', 'salt', 32);
+    const key = crypto.scryptSync(process.env.ENCRYPTION_KEY || 'kqBxxtSh2ufFdm78PZdbHfTweYQAGH7JyZkElgmE4dxZufxUzLBr38oMaTpAM1Ap', 'salt', 32);
     const iv = crypto.randomBytes(16);
     const cipher = crypto.createCipheriv(algorithm, key, iv);
     let encrypted = cipher.update(password, 'utf8', 'hex');

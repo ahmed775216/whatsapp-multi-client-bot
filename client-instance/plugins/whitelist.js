@@ -75,6 +75,8 @@ async function addToWhitelist(jid) {
             `, [botInstanceId, jid, jid.split('@')[0]]);
             whitelistCache.users.add(jid);
         }
+        // --- ADD THIS LINE ---
+        whitelistCache.lastLoaded = 0; // Invalidate cache to force a DB reload on next check.
 
         return { success: true };
     } catch (error) {
@@ -108,6 +110,9 @@ async function removeFromWhitelist(jid) {
             whitelistCache.users.delete(jid);
         }
 
+        // --- ADD THIS LINE ---
+        whitelistCache.lastLoaded = 0; // Invalidate cache to force a DB reload on next check.
+
         return { success: true };
     } catch (error) {
         console.error('[WHITELIST] Error removing from whitelist:', error);
@@ -115,19 +120,19 @@ async function removeFromWhitelist(jid) {
     }
 }
 
-// LID resolution functions using database
+// LID resolution functions using database// This function now looks in bot_contacts
 async function getLidToPhoneJidFromCache(lidJid) {
     const botInstanceId = await getBotInstanceId();
     if (!botInstanceId) return null;
 
     try {
         const result = await db.query(
-            'SELECT resolved_phone_jid FROM lid_resolutions WHERE bot_instance_id = $1 AND lid_jid = $2',
+            'SELECT user_jid FROM bot_contacts WHERE bot_instance_id = $1 AND lid_jid = $2 AND user_jid IS NOT NULL',
             [botInstanceId, lidJid]
         );
-        return result.rows[0]?.resolved_phone_jid || null;
+        return result.rows[0]?.user_jid || null;
     } catch (error) {
-        console.error('[WHITELIST] Error getting LID resolution:', error);
+        console.error('[WHITELIST] Error getting LID resolution from bot_contacts:', error);
         return null;
     }
 }
@@ -136,20 +141,20 @@ async function cacheLidToPhoneJid(lidJid, phoneJid, displayName = null) {
     const botInstanceId = await getBotInstanceId();
     if (!botInstanceId) return;
 
-    try {
-        await db.query(`
-            INSERT INTO lid_resolutions (bot_instance_id, lid_jid, resolved_phone_jid, display_name)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (bot_instance_id, lid_jid) 
-            DO UPDATE SET 
-                resolved_phone_jid = $3,
-                display_name = $4,
-                resolved_at = CURRENT_TIMESTAMP
-        `, [botInstanceId, lidJid, phoneJid, displayName]);
+    // const phoneNumber = phoneJid.split('@')[0];
 
-        console.log(`[WHITELIST] Cached LID resolution: ${lidJid} -> ${phoneJid}`);
+    try {
+        // Use our powerful upsert logic from botContactsDb
+        const { upsertBotContact } = require('../database/botContactsDb');
+        await upsertBotContact(botInstanceId, phoneJid, displayName, displayName);
+        await db.query(
+            'UPDATE bot_contacts SET lid_jid = $1 WHERE bot_instance_id = $2 AND user_jid = $3',
+            [lidJid, botInstanceId, phoneJid]
+        );
+
+        console.log(`[WHITELIST] Cached LID resolution in bot_contacts: ${lidJid} -> ${phoneJid}`);
     } catch (error) {
-        console.error('[WHITELIST] Error caching LID resolution:', error);
+        console.error('[WHITELIST] Error caching LID resolution in bot_contacts:', error);
     }
 }
 // Update these functions to use database

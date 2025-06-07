@@ -5,7 +5,7 @@ function encryptPassword(password) {
     
     // Simple encryption for now - you can enhance this
     const algorithm = 'aes-256-cbc';
-    const key = crypto.scryptSync(process.env.ENCRYPTION_KEY || 'default-encryption-key-32-chars!', 'salt', 32);
+    const key = crypto.scryptSync(process.env.ENCRYPTION_KEY || 'kqBxxtSh2ufFdm78PZdbHfTweYQAGH7JyZkElgmE4dxZufxUzLBr38oMaTpAM1Ap', 'salt', 32);
     const iv = crypto.randomBytes(16);
     const cipher = crypto.createCipheriv(algorithm, key, iv);
     
@@ -20,7 +20,7 @@ function decryptPassword(encryptedPassword) {
     
     const [ivHex, encrypted] = encryptedPassword.split(':');
     const algorithm = 'aes-256-cbc';
-    const key = crypto.scryptSync(process.env.ENCRYPTION_KEY || 'default-encryption-key-32-chars!', 'salt', 32);
+    const key = crypto.scryptSync(process.env.ENCRYPTION_KEY || 'kqBxxtSh2ufFdm78PZdbHfTweYQAGH7JyZkElgmE4dxZufxUzLBr38oMaTpAM1Ap', 'salt', 32);
     const iv = Buffer.from(ivHex, 'hex');
     const decipher = crypto.createDecipheriv(algorithm, key, iv);
     

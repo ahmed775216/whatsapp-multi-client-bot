@@ -15,11 +15,11 @@ module.exports = {
         // originalMessageSenderJid هو JID المرسل الأصلي (m.key.participant || m.key.remoteJid)
 
         // الحصول على كاشات الذاكرة الدائمة
-        const askedLidsMap = getAskedLidsCache();
-        const pendingIdentificationsMap = getPendingLidIdentifications();
+        const askedLidsMap =await getAskedLidsCache();
+        const pendingIdentificationsMap =await getPendingLidIdentifications();
 
         // يجب أن نستخدم JID المرسل الأصلي للتحقق من كاش @lid و pendingIdentificationsMap
-        const originalMessageSenderJid = jidNormalizedUser(m.key.participant || m.key.remoteJid);
+        const originalMessageSenderJid =  jidNormalizedUser(m.key.participant || m.key.remoteJid);
 
 
         if (isOwner) {
@@ -41,7 +41,9 @@ module.exports = {
                 const isChatWhitelisted = isWhitelisted(chatId); // تحقق مما إذا كانت المجموعة نفسها في القائمة البيضاء
                  if (!isChatWhitelisted) {
                     console.log(`[${process.env.CLIENT_ID}_FILTER] Group ${chatId.split('@')[0]} not whitelisted. Blocking message from ${sender.split('@')[0]} (Name: ${pushName}).`);
-                    try { await sock.sendMessage(m.key.remoteJid, { react: { text: '🚫', key: m.key } }); } catch (e) { /* تجاهل أخطاء الرد */ }
+                    try { await sock.sendMessage(m.key.remoteJid, { react: { text: '🚫', key: m.key } }); } catch (e) { 
+                        console.error(`[${process.env.CLIENT_ID}_FILTER_ERROR] Failed to react to message from non-whitelisted group ${chatId.split('@')[0]}: ${e.message}`);
+                     }
                     return {}; // Block message
                 }
 
@@ -49,7 +51,9 @@ module.exports = {
                 const senderAllowedInGroups = global.userGroupPermissions && global.userGroupPermissions[sender] && global.userGroupPermissions[sender].allowed_in_groups === true;
                 if (!senderAllowedInGroups) {
                     console.log(`[${process.env.CLIENT_ID}_FILTER] Sender ${sender.split('@')[0]} (Name: ${pushName}) is whitelisted but NOT allowed in groups. Blocking message in group ${chatId.split('@')[0]}.`);
-                    try { await sock.sendMessage(m.key.remoteJid, { react: { text: ' Restricted Access 🚫', key: m.key } }); } catch (e) { /* تجاهل أخطاء الرد */ }
+                    try { await sock.sendMessage(m.key.remoteJid, { react: { text: ' Restricted Access 🚫', key: m.key } }); } catch (e) { 
+                        console.error(`[${process.env.CLIENT_ID}_FILTER_ERROR] Failed to react to message from non-whitelisted group ${chatId.split('@')[0]}: ${e.message}`);
+                     }
                     return {}; // Block message
                 }
             }
@@ -93,7 +97,9 @@ module.exports = {
                 // await m.reply(`عذراً ${pushName || ''}! لا يمكنك استخدام هذا البوت. يرجى التواصل مع المسؤول إذا كنت تعتقد أن هذا خطأ.`);
             } catch (e) { console.error(`[${process.env.CLIENT_ID}_FILTER_ERROR] Failed to send DM rejection to non-whitelisted user ${sender.split('@')[0]}: ${e.message}`); }
         } else { // في المجموعات، يمكن وضع رد فعل فقط
-             try { await sock.sendMessage(m.key.remoteJid, { react: { text: '🚫', key: m.key } }); } catch (e) { /* تجاهل أخطاء الرد */ }
+             try { await sock.sendMessage(m.key.remoteJid, { react: { text: '🚫', key: m.key } }); } catch (e) {
+                console.error(`[${process.env.CLIENT_ID}_FILTER_ERROR] Failed to react to message from non-whitelisted user ${sender.split('@')[0]}: ${e.message}`);
+              }
         }
         return {}; // Block message
     }

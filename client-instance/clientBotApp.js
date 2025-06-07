@@ -4,14 +4,32 @@ const pino = require('pino');
 const path = require('path'); // Ensure path is required correctly
 const fs = require('fs');
 const WebSocket = require('ws');
+const { upsertBotContact, getClientBotInstanceId } = require('../database/botContactsDb');
 let process = require('process');
 const AUTH_DIR = process.env.AUTH_DIR;
 const DATA_DIR = process.env.DATA_DIR;
 const CLIENT_ID = process.env.CLIENT_ID;
+console.log(`[CLIENT_APP_INIT_DEBUG] Instance started with CLIENT_ID from env: '${CLIENT_ID}' (Type: ${typeof CLIENT_ID})`);
 const MANAGER_WS_PORT = parseInt(process.env.MANAGER_WS_PORT || '0');
+// client-instance/clientBotApp.js
 
-if (!AUTH_DIR || !DATA_DIR || !CLIENT_ID || MANAGER_WS_PORT === 0) {
-    console.error(`[${CLIENT_ID}_FATAL] Missing required environment variables. Exiting.`);
+// ... after const MANAGER_WS_PORT = ...
+
+let botInstanceId = null; // <-- ADD THIS
+(async () => { // <-- ADD THIS IIFE WRAPPER
+    try {
+        botInstanceId = await getClientBotInstanceId(CLIENT_ID);
+        if (!botInstanceId) {
+            console.error(`[${CLIENT_ID}_FATAL] Could not retrieve botInstanceId from database on startup. Contact persistence will fail.`);
+        } else {
+            console.log(`[${CLIENT_ID}] Bot Instance ID for contact persistence: ${botInstanceId}`);
+        }
+    } catch (e) {
+        console.error(`[${CLIENT_ID}_FATAL] Database error getting botInstanceId on startup: ${e.message}`);
+    }
+})();
+if (!AUTH_DIR || !DATA_DIR || !CLIENT_ID || MANAGER_WS_PORT === 0) { // Ensure CLIENT_ID here is also checked
+    console.error(`[${CLIENT_ID || 'UNKNOWN_CLIENT'}_FATAL] Missing required environment variables. AUTH_DIR=${AUTH_DIR}, DATA_DIR=${DATA_DIR}, CLIENT_ID=${CLIENT_ID}, MANAGER_WS_PORT=${MANAGER_WS_PORT}. Exiting.`);
     process.exit(1);
 }
 
@@ -301,24 +319,42 @@ async function startClientBot() {
 
     sock.ev.on('creds.update', saveCreds);
 
+    // client-instance/clientBotApp.js
+
     sock.ev.on('messages.upsert', async (upsert) => {
         if (upsert.type !== 'notify') return;
-        // console.log(`[${CLIENT_ID}] Received ${upsert.messages.length} new messages.`); // Can be very noisy
+
         for (const m of upsert.messages) {
-            if (m.key.remoteJid && m.pushName && m.pushName !== "UnknownPN") {
-                const senderJidForCache = jidNormalizedUser(m.key.participant || m.key.remoteJid);
-                if (senderJidForCache) {
-                    global.pushNameCache.set(senderJidForCache, m.pushName);
-                }
+            const senderJid = jidNormalizedUser(m.key.participant || m.key.remoteJid);
+            const pushName = m.pushName;
+
+            // Update the temporary cache for immediate use
+            if (senderJid && pushName && pushName !== "UnknownPN") {
+                global.pushNameCache.set(senderJid, pushName);
             }
+
+            // client-instance/clientBotApp.js -> inside 'messages.upsert' handler
+
+            // **Persist the learned name to the database**
+            if (botInstanceId && senderJid && pushName && pushName !== "UnknownPN") {
+                // This is a "fire-and-forget" call for performance.
+                upsertBotContact(
+                    botInstanceId,
+                    senderJid,
+                    pushName,      // displayName
+                    pushName       // whatsappName
+                ).catch(e => console.error(`[${CLIENT_ID}] Background contact upsert failed for ${senderJid}: ${e.message}`));
+            }
+
             if (!m.key.fromMe) {
                 await handleMessage(sock, m, { clientId: CLIENT_ID });
             }
         }
-    });// NEW: Listen for when contacts are first populated or updated by Baileys store
+    });
+    // NEW: Listen for when contacts are first populated or updated by Baileys store
     // This is the more reliable way to know when contacts are ready.
     let initialContactsSet = false; // Flag to ensure initial sync runs only once per session
-    sock.ev.on('contacts.set', async ({ contacts, is }) => {
+    sock.ev.on('contacts.set', async ({ contacts }) => {
         console.log(`[${CLIENT_ID}] contacts.set event received. Total: ${contacts.length}. Initial sync: ${!initialContactsSet}`);
         // If this is the initial full set of contacts, or a subsequent large update.
         // We'll run fetchAndSaveContacts when a full set is received.

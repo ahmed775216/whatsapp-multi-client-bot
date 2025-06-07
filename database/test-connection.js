@@ -1,27 +1,30 @@
-const db = require('./db');
+// const db = require('./db'); // Comment out pool for now
+const { Client } = require('pg');
 
 async function testConnection() {
+    console.log("Attempting direct client connection...");
+    const client = new Client({
+        host: process.env.DB_HOST || 'localhost',
+        port: parseInt(process.env.DB_PORT || '15432'),
+        database: process.env.DB_NAME || 'whatsapp_bot_system',
+        user: process.env.DB_USER || 'postgres',
+        password: process.env.DB_PASSWORD || 'postgres_admin_password',
+        connectionTimeoutMillis: 5000, // Increased timeout
+    });
+
     try {
-        const result = await db.query('SELECT current_database(), current_user, version()');
+        await client.connect();
+        console.log('Direct client connection successful!');
+        const result = await client.query('SELECT current_database(), current_user, version()');
         console.log('Connected to database:', result.rows[0].current_database);
         console.log('As user:', result.rows[0].current_user);
         console.log('PostgreSQL version:', result.rows[0].version);
-        
-        // Test table creation
-        const tables = await db.query(`
-            SELECT table_name 
-            FROM information_schema.tables 
-            WHERE table_schema = 'public' 
-            ORDER BY table_name
-        `);
-        console.log('\nTables created:');
-        tables.rows.forEach(row => console.log(' -', row.table_name));
-        
+        await client.end();
         process.exit(0);
     } catch (err) {
-        console.error('Connection test failed:', err);
+        console.error('Direct client connection test failed:', err);
+        if (client) await client.end().catch(e => console.error("Error ending client after failure:", e));
         process.exit(1);
     }
 }
-
 testConnection();

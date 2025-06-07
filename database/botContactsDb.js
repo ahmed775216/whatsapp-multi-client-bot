@@ -1,7 +1,7 @@
 // database/botContactsDb.js
 const db = require('./db'); // Assuming db.js exports pool.query
-const { getBotInstanceId } = require('../client-instance/lib/apiSync'); // Get bot instance ID from client-instance context
-const { UPSERT_CONTACT, DELETE_STALE_CONTACTS_FOR_INSTANCE, GET_CONTACT_BY_JID } = require('./queries'); // Import new queries
+// const { getBotInstanceId } = require('../client-instance/lib/apiSync'); // Get bot instance ID from client-instance context
+const {  DELETE_STALE_CONTACTS_FOR_INSTANCE, GET_CONTACT_BY_JID } = require('./queries'); // Import new queries
 let process = require('process');
 async function getClientBotInstanceId(clientId = process.env.CLIENT_ID) {
     // We explicitly pass CLIENT_ID from process.env because this module
@@ -13,29 +13,82 @@ async function getClientBotInstanceId(clientId = process.env.CLIENT_ID) {
     return result.rows[0]?.id;
 }
 
-async function upsertBotContact(botInstanceId, contactJid, phoneNumber, displayName, whatsappName, isWhatsappContact = true, isSavedContact = true) {
-    if (!botInstanceId) {
-        console.error("[BOT_CONTACTS_DB] Missing botInstanceId for upserting contact.");
-        return;
-    }
-    if (!contactJid) {
-        console.warn("[BOT_CONTACTS_DB] Missing contactJid for upserting contact. Skipping.");
+// database/botContactsDb.js
+// database/botContactsDb.js
+// database/botContactsDb.js
+const { INSERT_BOT_CONTACT, UPDATE_BOT_CONTACT, GET_CONTACT_BY_ANY_JID, GET_CONTACT_BY_NAME } = require('./queries');
+
+async function upsertBotContact(botInstanceId, jid, displayName, whatsappName, isWhatsappContact = true, isSavedContact = false) {
+    if (!botInstanceId || !jid || !displayName) {
+        console.warn("[BOT_CONTACTS_DB] Missing botInstanceId, JID, or displayName for upsert. Skipping.");
         return;
     }
 
     try {
-        await db.query(UPSERT_CONTACT, [
-            botInstanceId,
-            contactJid,
-            phoneNumber,
-            displayName,
-            whatsappName,
-            isWhatsappContact,
-            isSavedContact
-        ]);
-        // console.log(`[BOT_CONTACTS_DB] Upserted contact ${contactJid} for bot ${botInstanceId}`); // Can be noisy
+        let existingContactId = null;
+
+        // --- HIERARCHY FOR FINDING EXISTING CONTACT ---
+
+        // 1. First, try to find an exact match on the JID (phone or LID). This is the most reliable match.
+        const existingJidResult = await db.query(GET_CONTACT_BY_ANY_JID, [botInstanceId, jid]);
+        if (existingJidResult.rows.length > 0) {
+            existingContactId = existingJidResult.rows[0].id;
+        }
+
+        // 2. If no JID match, try to find a match by display_name.
+        // This helps merge records when a known user messages from a new device (LID).
+        if (!existingContactId) {
+            const existingNameResult = await db.query(GET_CONTACT_BY_NAME, [botInstanceId, displayName]);
+            if (existingNameResult.rows.length > 0) {
+                const foundContact = existingNameResult.rows[0];
+                // Check if we are about to overwrite a more specific JID with null. We shouldn't.
+                const isIncomingJidLid = jid.endsWith('@lid');
+                const isExistingJidPhone = foundContact.user_jid && !foundContact.user_jid.endsWith('@lid');
+
+                // Don't merge if the existing contact has a phone number but the new message is from a LID.
+                // This prevents a temporary LID from "claiming" a primary contact record.
+                // We let the LID create its own record, which can be merged later if resolved.
+                if (!(isIncomingJidLid && isExistingJidPhone)) {
+                    existingContactId = foundContact.id;
+                }
+            }
+        }
+        
+        const isLid = jid.endsWith('@lid');
+        const userJid = isLid ? null : jid;
+        const lidJid = isLid ? jid : null;
+        const phoneNumber = isLid ? null : jid.split('@')[0];
+
+        if (existingContactId) {
+            // --- UPDATE EXISTING RECORD ---
+            // It exists, so we update it with any new non-null information.
+            // COALESCE is used to avoid overwriting existing data with nulls.
+            await db.query(UPDATE_BOT_CONTACT, [
+                existingContactId,
+                userJid,
+                lidJid,
+                phoneNumber,
+                displayName,
+                whatsappName
+            ]);
+            // console.log(`[BOT_CONTACTS_DB] Updated contact for JID: ${jid}, Name: ${displayName}`);
+        } else {
+            // --- INSERT NEW RECORD ---
+            // It's a genuinely new contact, so we insert it.
+            await db.query(INSERT_BOT_CONTACT, [
+                botInstanceId,
+                userJid,
+                lidJid,
+                phoneNumber,
+                displayName,
+                whatsappName,
+                isWhatsappContact,
+                isSavedContact
+            ]);
+            // console.log(`[BOT_CONTACTS_DB] Inserted new contact for JID: ${jid}, Name: ${displayName}`);
+        }
     } catch (error) {
-        console.error(`[BOT_CONTACTS_DB_ERROR] Failed to upsert contact ${contactJid} for bot ${botInstanceId}: ${error.message}`, error.stack);
+        console.error(`[BOT_CONTACTS_DB_ERROR] Failed to upsert contact ${jid} for bot ${botInstanceId}: ${error.message}`, error.stack);
     }
 }
 

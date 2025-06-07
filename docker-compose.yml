@@ -1,16 +1,15 @@
-version: '3.8'
 
 services:
   postgres:
     image: postgres:15-alpine
     container_name: whatsapp_bot_postgres
-    restart: always
+    restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres_admin_password
       POSTGRES_DB: whatsapp_bot_system
     ports:
-      - "5432:5432"
+      - "15432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./database/init:/docker-entrypoint-initdb.d

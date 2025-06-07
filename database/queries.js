@@ -5,14 +5,14 @@ module.exports = {
         FROM whitelisted_users
         WHERE bot_instance_id = $1 AND api_active = true
     `,
-    
+
     // Get user permissions
     getUserPermissions: `
         SELECT allowed_in_groups, api_contact_id
         FROM whitelisted_users
         WHERE bot_instance_id = $1 AND user_jid = $2 AND api_active = true
     `,
-    
+
     // Check if user/group is whitelisted
     checkWhitelist: `
         SELECT EXISTS(
@@ -23,19 +23,7 @@ module.exports = {
             WHERE bot_instance_id = $1 AND group_jid = $2 AND is_active = true
         )
     `,
-    UPSERT_CONTACT: `
-        INSERT INTO bot_contacts 
-        (bot_instance_id, user_jid, phone_number, display_name, whatsapp_name, is_whatsapp_contact, is_saved_contact)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT (bot_instance_id, user_jid) 
-        DO UPDATE SET 
-            phone_number = $3, 
-            display_name = $4,
-            whatsapp_name = $5,
-            is_whatsapp_contact = $6,
-            is_saved_contact = $7,
-            synced_at = CURRENT_TIMESTAMP
-    `,
+
 
     // New: Delete/mark as stale contacts not present in the new sync
     DELETE_STALE_CONTACTS_FOR_INSTANCE: `
@@ -52,5 +40,33 @@ module.exports = {
     GET_CONTACT_BY_JID: `
         SELECT * FROM bot_contacts
         WHERE bot_instance_id = $1 AND user_jid = $2
-    `
+    `,
+// Replace the old UPSERT_CONTACT with these two simpler queries:
+INSERT_BOT_CONTACT: `
+    INSERT INTO bot_contacts
+    (bot_instance_id, user_jid, lid_jid, phone_number, display_name, whatsapp_name, is_whatsapp_contact, is_saved_contact)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    RETURNING id
+`,
+UPDATE_BOT_CONTACT: `
+    UPDATE bot_contacts SET
+        user_jid = COALESCE($2, user_jid),
+        lid_jid = COALESCE($3, lid_jid),
+        phone_number = COALESCE($4, phone_number),
+        display_name = COALESCE($5, display_name),
+        whatsapp_name = COALESCE($6, whatsapp_name),
+        synced_at = CURRENT_TIMESTAMP
+    WHERE id = $1
+`,
+// Also, let's add a query to find a contact by either JID
+GET_CONTACT_BY_ANY_JID: `
+    SELECT id FROM bot_contacts
+    WHERE bot_instance_id = $1 AND (user_jid = $2 OR lid_jid = $2)
+    LIMIT 1
+`,GET_CONTACT_BY_NAME: `
+SELECT id, user_jid, lid_jid FROM bot_contacts
+WHERE bot_instance_id = $1 AND display_name = $2
+ORDER BY synced_at DESC -- Get the most recent one if there are duplicates
+LIMIT 1
+`,
 };

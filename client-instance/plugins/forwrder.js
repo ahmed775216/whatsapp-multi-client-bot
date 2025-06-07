@@ -1,7 +1,7 @@
 // client-instance/plugins/forwrder.js
 const fetch = require('node-fetch');
 const { v4: uuidv4 } = require('uuid');
-const { isWhitelisted } = require('./whitelist');
+// const { isWhitelisted } = require('./whitelist'); // <-- REMOVED THIS LINE
 const { getApiToken } = require('../lib/apiSync');
 const config = require('../../config');
 let process = require('process');
@@ -28,12 +28,16 @@ function generateSourcePackageName() {
 }
 
 module.exports = {
-    all: async function (m, { sock, chatId, sender, isGroup, groupMetadata, isOwner, pushName /* pushName now passed in ctx */ }) {
+    // UPDATED: 'sock' parameter removed from the function signature
+    all: async function (m, { chatId, sender, isGroup, groupMetadata, isOwner, pushName }) {
+        if (typeof sender !== 'string' || !sender.includes('@')) {
+            console.warn(`[${process.env.CLIENT_ID}_FORWARDER-API] Skipping forwarder because sender is not a valid JID string. Sender:`, sender);
+            return m;
+        }
+
         console.log(`[${process.env.CLIENT_ID}_FORWARDER-API] Initiating forwarding for message from ${sender.split('@')[0]} (Name: ${pushName}) in ${isGroup ? 'group ' + (groupMetadata?.subject || chatId.split('@')[0]) : 'DM'}. IsOwner: ${isOwner}.`);
 
-        // فلتر القائمة البيضاء الأساسي يجب أن يكون قد تم تطبيقه في _whitelistFilter.js
-        // هنا، نفترض أن الرسالة مسموح بها للمتابعة إذا وصلت إلى هذه النقطة.
-        // ومع ذلك، قد تحتاج إلى إعادة فحص isWhitelisted(sender) إذا كنت تريد فلترة إضافية خاصة بهذا الـ plugin.
+        // The primary whitelist filter is applied in _whitelistFilter.js, so no check is needed here.
 
         try {
             const msgType = Object.keys(m.message)[0];
@@ -65,16 +69,15 @@ module.exports = {
                 console.log(`[${process.env.CLIENT_ID}_FORWARDER-API] No specific content extraction for msgType: ${msgType}. Content will be empty.`);
             }
 
-            const fullSenderPhoneNumber = sender.split('@')[0]; // هذا قد يكون رقم أو جزء من @lid
-            // إذا كان sender هو @lid ولم يتم حله، فإن stripCountryCode لن يفعل الكثير
+            const fullSenderPhoneNumber = sender.split('@')[0];
             const senderPhoneNumberForApi = sender.endsWith('@s.whatsapp.net')
                 ? stripCountryCode(fullSenderPhoneNumber, config.DEFAULT_PHONE_COUNTRY_CODE)
-                : fullSenderPhoneNumber; // إذا كان @lid، أرسله كما هو أو "غير معروف"
+                : fullSenderPhoneNumber;
 
             const payload = {
                 original_content: originalContent,
                 sender_phone_number_from_device_contacts: senderPhoneNumberForApi,
-                sender_display_name_from_notification: pushName, // استخدام pushName المستلم
+                sender_display_name_from_notification: pushName,
                 source_package_name: generateSourcePackageName(),
                 client_event_key: uuidv4(),
                 event_timestamp_utc: new Date(m.messageTimestamp * 1000).toISOString(),
@@ -97,13 +100,8 @@ module.exports = {
                 body: JSON.stringify(payload),
             });
             if (response.ok) {
-                // إذا كانت الاستجابة ناجحة، يمكنك معالجة البيانات إذا لزم الأمر
                 const responseData = await response.json();
-                // showw the response data in the console for debugging
                 console.log(`[${process.env.CLIENT_ID}_FORWARDER-API] Successfully sent raw notification. Response:${response.status}`, responseData);
-
-
-                // console.log(`[${process.env.CLIENT_ID}_FORWARDER-API] Successfully sent raw notification. Status: `);
             } else {
                 const errorText = await response.text();
                 console.error(`[${process.env.CLIENT_ID}_FORWARDER-API] Failed to send raw notification. Status: ${response.status}. Response: ${errorText}`);
@@ -112,7 +110,7 @@ module.exports = {
         } catch (error) {
             console.error(`[${process.env.CLIENT_ID}_FORWARDER-API] Critical Error processing message for API:`, error.message, error.stack);
         }
-        // لا تحظر الرسالة هنا، دعها تستمر للمعالجات الأخرى إذا لزم الأمر
+        
         return m;
     }
 };

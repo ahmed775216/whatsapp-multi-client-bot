@@ -35,11 +35,27 @@ function normalizePhoneNumberToJid(mobileNumber) {
 }
 
 async function getBotInstanceId() {
-    const result = await db.query(
-        'SELECT id FROM bot_instances WHERE client_id = $1',
-        [process.env.CLIENT_ID]
-    );
-    return result.rows[0]?.id;
+    console.log(`[API_SYNC_CRITICAL_DEBUG] In getBotInstanceId - process.env.CLIENT_ID value is: '${process.env.CLIENT_ID}' (Type: ${typeof process.env.CLIENT_ID})`); // CRITICAL LOG
+    if (!process.env.CLIENT_ID || typeof process.env.CLIENT_ID !== 'string' || process.env.CLIENT_ID.trim() === '') {
+        console.error(`[API_SYNC_CRITICAL_ERROR] process.env.CLIENT_ID is invalid or not set when getBotInstanceId is called!`);
+        return null; // Early exit if CLIENT_ID is bad
+    }
+    try {
+        const result = await db.query(
+            'SELECT id FROM bot_instances WHERE client_id = $1',
+            [process.env.CLIENT_ID]
+        );
+        if (result.rows.length > 0) {
+            console.log(`[API_SYNC_DEBUG] Found bot_instance_id: ${result.rows[0]?.id} for CLIENT_ID: ${process.env.CLIENT_ID}`);
+            return result.rows[0]?.id;
+        } else {
+            console.error(`[API_SYNC_ERROR] No bot_instance_id found in DB for CLIENT_ID: ${process.env.CLIENT_ID}. Query was: SELECT id FROM bot_instances WHERE client_id = '${process.env.CLIENT_ID}'`); // Log the actual query
+            return null;
+        }
+    } catch (dbError) {
+        console.error(`[API_SYNC_DB_ERROR] Error querying for bot_instance_id for ${process.env.CLIENT_ID}: ${dbError.message}`, dbError.stack);
+        return null;
+    }
 }
 // let process = require('process');
 async function loginToApi() {
