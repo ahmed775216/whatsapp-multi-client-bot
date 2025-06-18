@@ -137,16 +137,24 @@ async function getLidToPhoneJidFromCache(lidJid) {
     }
 }
 
-async function cacheLidToPhoneJid(lidJid, phoneJid, displayName = null) {
+// client-instance/plugins/whitelist.js
+async function cacheLidToPhoneJid(lidJid, phoneJid) { // Removed displayName from parameters, we will fetch it.
     const botInstanceId = await getBotInstanceId();
     if (!botInstanceId) return;
 
-    // const phoneNumber = phoneJid.split('@')[0];
-
     try {
-        // Use our powerful upsert logic from botContactsDb
-        const { upsertBotContact } = require('../database/botContactsDb');
+        const { upsertBotContact, getContactByJid } = require('../../database/botContactsDb');
+
+        // Step 1: Fetch the existing contact record for the LID to get its name.
+        const lidContact = await getContactByJid(botInstanceId, lidJid);
+        const displayName = lidContact?.display_name || phoneJid.split('@')[0]; // Use existing name or fallback to phone number part
+
+        // Step 2: Now upsert the contact using the phoneJid as the primary key.
+        // This will find the record by name (if it exists) or create a new one.
         await upsertBotContact(botInstanceId, phoneJid, displayName, displayName);
+
+        // Step 3: Ensure the LID is associated with the updated record.
+        // We find the record by its primary phone JID and update its lid_jid field.
         await db.query(
             'UPDATE bot_contacts SET lid_jid = $1 WHERE bot_instance_id = $2 AND user_jid = $3',
             [lidJid, botInstanceId, phoneJid]

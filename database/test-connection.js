@@ -1,14 +1,14 @@
 // const db = require('./db'); // Comment out pool for now
 const { Client } = require('pg');
-
+let process = require('process')
 async function testConnection() {
     console.log("Attempting direct client connection...");
     const client = new Client({
         host: process.env.DB_HOST || 'localhost',
-        port: parseInt(process.env.DB_PORT || '15432'),
+        port: process.env.DB_PORT || 5432,
         database: process.env.DB_NAME || 'whatsapp_bot_system',
         user: process.env.DB_USER || 'postgres',
-        password: process.env.DB_PASSWORD || 'postgres_admin_password',
+        password: process.env.DB_PASSWORD || 'Ahmed@2025',
         connectionTimeoutMillis: 5000, // Increased timeout
     });
 

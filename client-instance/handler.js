@@ -144,6 +144,8 @@ async function handleMessage(sock, m, options = {}) {
                 // End of fetchParticipants case
                 // In client-instance/handler.js
 
+                // In client-instance/handler.js
+
                 case 'fetchParticipants':
                     {
                         console.log(`[${clientIdForReply}_HANDLER_INTERNAL] Processing 'fetchParticipants' command.`);
@@ -172,34 +174,31 @@ async function handleMessage(sock, m, options = {}) {
                         const processedParticipants = [];
 
                         for (const p of rawParticipants) {
-                            const participantJid = jidNormalizedUser(p.id);
-                            let resolvedJidForPayload = null;
+                            const participantJid = jidNormalizedUser(p.id); // This is the JID Baileys gives us
+
+                            // --- NEW: UNIFIED DATABASE LOOKUP ---
+                            // Perform one single query to get the complete contact record from our database.
+                            // getContactByJid is smart and can find the record by phone JID or LID.
+                            const dbContact = await getContactByJid(botInstanceId, participantJid);
 
                             // --- NAME FINDING HIERARCHY ---
                             let displayName = p.name || p.notify; // 1. Name from Baileys' current session metadata
                             if (!displayName) displayName = global.pushNameCache?.get(participantJid); // 2. Name from our live message cache
-                            if (!displayName) { // 3. Name from our persistent database
-                                const dbContact = await getContactByJid(botInstanceId, participantJid);
-                                if (dbContact && dbContact.display_name) {
-                                    displayName = dbContact.display_name;
-                                }
-                            }
-                            // Fallback is handled in C#
+                            if (!displayName && dbContact) displayName = dbContact.display_name; // 3. Name from our persistent database record
 
-                            // --- JID & WHITELIST LOGIC (as before) ---
-                            if (participantJid.endsWith('@lid')) {
-                                const resolvedPhoneJidFromCache = await getLidToPhoneJidFromCache(participantJid);
-                                if (resolvedPhoneJidFromCache && typeof resolvedPhoneJidFromCache === 'string') {
-                                    resolvedJidForPayload = resolvedPhoneJidFromCache;
-                                }
-                            }
+                            // --- JID & WHITELIST LOGIC ---
+                            // The resolved phone JID is whatever is in our database record's 'user_jid' column.
+                            const resolvedJidForPayload = dbContact?.user_jid || null;
 
-                            const isParticipantWhitelisted = await isWhitelisted(resolvedJidForPayload || participantJid);
+                            // For the whitelist check, we prioritize the resolved phone JID if it exists,
+                            // otherwise we fall back to the JID Baileys gave us.
+                            const jidForWhitelistCheck = resolvedJidForPayload || participantJid;
+                            const isParticipantWhitelisted = await isWhitelisted(jidForWhitelistCheck);
 
                             processedParticipants.push({
-                                jid: participantJid,
-                                resolvedJid: resolvedJidForPayload,
-                                displayName: displayName, // <-- Pass the best name we found
+                                jid: participantJid,                  // The original JID from the group (could be LID)
+                                resolvedJid: resolvedJidForPayload,   // The resolved phone JID from our DB, if it exists
+                                displayName: displayName,             // The best name we could find
                                 isAdmin: (p.admin === 'admin' || p.admin === 'superadmin'),
                                 isWhitelisted: isParticipantWhitelisted
                             });
@@ -346,7 +345,7 @@ async function handleMessage(sock, m, options = {}) {
     }
 
     if (originalMessageSenderJid.endsWith('@lid') && !isOwner) {
-        const cachedPhoneJid =await getLidToPhoneJidFromCache(originalMessageSenderJid);
+        const cachedPhoneJid = await getLidToPhoneJidFromCache(originalMessageSenderJid);
         if (cachedPhoneJid) {
             actualSenderForLogic = cachedPhoneJid;
             console.log(`[${process.env.CLIENT_ID}_HANDLER] Resolved @lid ${originalMessageSenderJid} to ${actualSenderForLogic} from LIDCached.`);
@@ -393,7 +392,7 @@ async function handleMessage(sock, m, options = {}) {
 
     console.log(`[${process.env.CLIENT_ID}_HANDLER] MSG From: ${typeof actualSenderForLogic === 'string' ? actualSenderForLogic.split('@')[0] : actualSenderForLogic} (LID?: ${originalMessageSenderJid}, Name: ${pushName}) in ${isGroup ? 'Group: ' + (groupMetadata.subject || chatId.split('@')[0]) : 'DM'}. IsOwner: ${isOwner}.`);
 
-    m.reply = (text, targetChatId = m.key.remoteJid, replyOptions = {}) => sock.sendMessage(targetChatId, (typeof text === 'string') ? { text: text } : text, { quoted: m, ...replyOptions });
+    // m.reply = (text, targetChatId = m.key.remoteJid, replyOptions = {}) => sock.sendMessage(targetChatId, (typeof text === 'string') ? { text: text } : text, { quoted: m, ...replyOptions });
     const msgContextInfo = m.message?.[msgType]?.contextInfo;
     m.mentionedJid = msgContextInfo?.mentionedJid || [];
     if (m.message?.[msgType]?.contextInfo?.quotedMessage) {
@@ -405,8 +404,8 @@ async function handleMessage(sock, m, options = {}) {
 
     const textContent = m.message?.conversation || m.message?.[msgType]?.text || m.message?.[msgType]?.caption || '';
 
-    const pendingIdentificationsMap =await getPendingLidIdentifications();
-    const askedLidsMap =await getAskedLidsCache();
+    const pendingIdentificationsMap = await getPendingLidIdentifications();
+    const askedLidsMap = await getAskedLidsCache();
 
     if (originalMessageSenderJid.endsWith('@lid') && pendingIdentificationsMap.has(originalMessageSenderJid) && !isOwner) {
         const phoneRegex = /(?:\+|\d{1,3})?\s*(?:\d[\s-]*){7,15}\d/;
@@ -425,7 +424,7 @@ async function handleMessage(sock, m, options = {}) {
                 askedLidsMap.delete(originalMessageSenderJid);
                 saveAskedLidsFile();
 
-                await m.reply(`شكرًا لك ${pushName || ''}! تم التحقق من رقمك (${providedPhoneNumber}). يمكنك الآن استخدام خدمات البوت. يرجى إعادة إرسال طلبك الأصلي إذا لم تتم معالجته.`);
+                // await m.reply(`شكرًا لك ${pushName || ''}! تم التحقق من رقمك (${providedPhoneNumber}). يمكنك الآن استخدام خدمات البوت. يرجى إعادة إرسال طلبك الأصلي إذا لم تتم معالجته.`);
 
                 // إرسال تحديث إلى المدير بالـ JID المحلول والاسم
                 const { reportLidResolution } = require('./clientBotApp'); // استيراد الدالة
@@ -437,7 +436,7 @@ async function handleMessage(sock, m, options = {}) {
                 return {};
             } else {
                 console.log(`[${process.env.CLIENT_ID}_HANDLER_IDENTIFY] Provided phone ${providedPhoneJid || providedPhoneNumber} by ${originalMessageSenderJid} (Name: ${pushName}) is NOT whitelisted.`);
-                await m.reply(`عذرًا ${pushName || ''}! الرقم الذي قدمته (${providedPhoneNumber}) غير موجود في قائمة المستخدمين المصرح لهم. يرجى التأكد من الرقم أو التواصل مع المسؤول.`);
+                // await m.reply(`عذرًا ${pushName || ''}! الرقم الذي قدمته (${providedPhoneNumber}) غير موجود في قائمة المستخدمين المصرح لهم. يرجى التأكد من الرقم أو التواصل مع المسؤول.`);
                 return {};
             }
         } else {
@@ -479,32 +478,44 @@ async function handleMessage(sock, m, options = {}) {
             case '!whitelistgroup':
                 if (ctx.isGroup) {
                     const addResult = addToWhitelist(ctx.chatId);
-                    m.reply(addResult.success ? `Group ${ctx.groupMetadata.subject || ctx.chatId} added to whitelist.` : `Failed: ${addResult.reason}`);
-                } else { m.reply(`This command can only be used in a group.`); }
+                    console.log(addResult.success ? `Group ${ctx.groupMetadata.subject || ctx.chatId} added to whitelist.` : `Failed: ${addResult.reason}`);
+                } else {
+                    // m.reply(`This command can only be used in a group.`);
+                }
                 break;
             case '!removegroup':
                 if (ctx.isGroup) {
                     const removeResult = removeFromWhitelist(ctx.chatId);
-                    m.reply(removeResult.success ? `Group ${ctx.groupMetadata.subject || ctx.chatId} removed from whitelist.` : `Failed: ${removeResult.reason}`);
-                } else { m.reply(`This command can only be used in a group.`); }
+                    console.log(removeResult.success ? `Group ${ctx.groupMetadata.subject || ctx.chatId} removed from whitelist.` : `Failed: ${removeResult.reason}`);
+                } else {
+                    //  m.reply(`This command can only be used in a group.`);
+                }
                 break;
             case '!addtochatwhitelist':
                 if (args.length > 0) {
                     const jidToAdd = formatJid(args[0]);
                     if (jidToAdd) {
                         const addResult = addToWhitelist(jidToAdd);
-                        m.reply(addResult.success ? `${jidToAdd.split('@')[0]} added to general whitelist.` : `Failed: ${addResult.reason}`);
-                    } else { m.reply(`Invalid JID format: ${args[0]}`); }
-                } else { m.reply(`Usage: !addtochatwhitelist <phone_number_or_group_jid>`); }
+                        console.log(addResult.success ? `${jidToAdd.split('@')[0]} added to general whitelist.` : `Failed: ${addResult.reason}`);
+                    } else {
+                        //  m.reply(`Invalid JID format: ${args[0]}`);
+                    }
+                } else {
+                    //  m.reply(`Usage: !addtochatwhitelist <phone_number_or_group_jid>`); 
+                }
                 break;
             case '!removefromchatwhitelist':
                 if (args.length > 0) {
                     const jidToRemove = formatJid(args[0]);
                     if (jidToRemove) {
                         const removeResult = removeFromWhitelist(jidToRemove);
-                        m.reply(removeResult.success ? `${jidToRemove.split('@')[0]} removed from general whitelist.` : `Failed: ${removeResult.reason}`);
-                    } else { m.reply(`Invalid JID format: ${args[0]}`); }
-                } else { m.reply(`Usage: !removefromchatwhitelist <phone_number_or_group_jid>`); }
+                        console.log(removeResult.success ? `${jidToRemove.split('@')[0]} removed from general whitelist.` : `Failed: ${removeResult.reason}`);
+                    } else {
+                        //  m.reply(`Invalid JID format: ${args[0]}`);
+                    }
+                } else {
+                    //  m.reply(`Usage: !removefromchatwhitelist <phone_number_or_group_jid>`);
+                }
                 break;
         }
     }

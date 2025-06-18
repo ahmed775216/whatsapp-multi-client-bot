@@ -532,7 +532,7 @@ async function pollForPostOtpNote(request, requestKey, sock) {
             
             const transferDetails = await getProcessedTransferDetails(request.apiTransferId); // Fetches from /success-transfers?id={id}
             if (transferDetails) {
-                await sock.sendMessage(request.senderJid, { text: `تفاصيل الحوالة بعد التأكيد:\n${transferDetails}` });
+                // await sock.sendMessage(request.senderJid, { text: `تفاصيل الحوالة بعد التأكيد:\n${transferDetails}` });
             } else {
                 console.log(`[POLL_POST_OTP_NOTE] No additional transfer details found via getProcessedTransferDetails for ${requestKey}.`);
             }
@@ -548,17 +548,18 @@ async function pollForPostOtpNote(request, requestKey, sock) {
 async function handleWithdrawalRequest(m, sender, originalTransferNumber, isOwner) {
     console.log(`[WITHDRAWAL_REQ] Request from ${sender} for transfer: ${originalTransferNumber}`);
     if (!isOwner && !isWhitelisted(sender)) { 
-         m.reply("عذراً، لا يمكنك استخدام هذا الأمر."); 
+        //  m.reply("عذراً، لا يمكنك استخدام هذا الأمر."); 
         return; }
     const senderInfo = global.userGroupPermissions?.[sender];
     if (!senderInfo || (senderInfo.contact_id === undefined || senderInfo.contact_id === null)) { 
-         m.reply("عفواً، معلومات حسابك غير مكتملة (CI).");
+        //  m.reply("عفواً، معلومات حسابك غير مكتملة (CI).");
          return; }
     const contactId = senderInfo.contact_id;
     let apiToken = getApiToken();
     if (!apiToken) apiToken = await loginToApi();
     if (!apiToken) { 
-         m.reply("خطأ اتصال (T1)."); return;
+        //  m.reply("خطأ اتصال (T1)."); 
+         return;
      }
 
     const payload = { contact_id: contactId, customer_request: "سحب", original_transfer_number: originalTransferNumber };
@@ -583,11 +584,11 @@ async function handleWithdrawalRequest(m, sender, originalTransferNumber, isOwne
         } else { 
             const errorMsg = responseData?.message || responseData?.Note || responseData?.notes || `فشل إرسال الطلب الأولي (Status: ${response.status})`;
             console.error(`[WITHDRAWAL_REQ_ERROR] Initial request failed: ${response.status}`, responseData);
-             m.reply(`خطأ: ${errorMsg}`);
+            //  m.reply(`خطأ: ${errorMsg}`);
         }
     } catch (error) {
         console.error(`[WITHDRAWAL_REQ_ERROR] Sending initial request:`, error);
-         m.reply("خطأ غير متوقع أثناء إرسال طلب السحب.");
+        //  m.reply("خطأ غير متوقع أثناء إرسال طلب السحب.");
     }
 }
 
@@ -599,7 +600,7 @@ async function handleOtpConfirmation(m, sender, receivedOtp) {
     );
 
     if (!pendingRequestKey || !pendingWithdrawals[pendingRequestKey]) {
-        m.reply("لا يوجد طلب سحب نشط ينتظر رمز تأكيد منك.");
+        // m.reply("لا يوجد طلب سحب نشط ينتظر رمز تأكيد منك.");
         return;
     }
 
@@ -634,7 +635,7 @@ async function handleOtpConfirmation(m, sender, receivedOtp) {
     } else {
         console.log("[OTP_VALIDATION] OTPs DID NOT MATCH.");
         console.log(`[OTP_VALIDATION_MISMATCH] Reason: Expected OTP ('${pendingRequest.expectedOtp}') did not match Received OTP ('${receivedOtpCleaned}'). Or expectedOtp was falsy.`);
-        m.reply(`رمز التأكيد (${receivedOtpCleaned}) غير صحيح. حاول مرة أخرى.`);
+        // m.reply(`رمز التأكيد (${receivedOtpCleaned}) غير صحيح. حاول مرة أخرى.`);
     }
 }
 
@@ -644,7 +645,7 @@ async function confirmOtpWithApi(pendingRequest, m, sock) {
         apiToken = await loginToApi();
     }
     if (!apiToken) {
-        m.reply("خطأ اتصال (T2C).");
+        // m.reply("خطأ اتصال (T2C).");
         return false;
     }
 
@@ -679,12 +680,12 @@ async function confirmOtpWithApi(pendingRequest, m, sock) {
             } catch (e) {
                  console.error(`[CONFIRM_OTP_ERROR] API OTP confirm failed: ${response.status} and error parsing response body:`, e);
             }
-            m.reply(`خطأ أثناء تأكيد الرمز: ${apiMessage}. حاول مرة أخرى أو تواصل مع الدعم.`);
+            // m.reply(`خطأ أثناء تأكيد الرمز: ${apiMessage}. حاول مرة أخرى أو تواصل مع الدعم.`);
             return false;
         }
     } catch (error) {
         console.error(`[CONFIRM_OTP_ERROR] Network error:`, error);
-        m.reply("خطأ شبكة أثناء تأكيد الرمز. حاول مرة أخرى.");
+        // m.reply("خطأ شبكة أثناء تأكيد الرمز. حاول مرة أخرى.");
         return false;
     }
 }
@@ -710,7 +711,7 @@ function cleanupOldStaleRequests() {
             const request = pendingWithdrawals[key];
             console.log(`[WITHDRAWAL_REQ_CLEANUP] Removing stale request: ${key} with status ${request.status}`);
             if (localSock && request.senderJid) {
-                localSock.sendMessage(request.senderJid, { text: `تم إلغاء طلب السحب الخاص بك (${request.originalTransferNumber}) تلقائيًا بسبب انتهاء المهلة.` }).catch(e => console.error("Error sending stale notification", e));
+                // localSock.sendMessage(request.senderJid, { text: `تم إلغاء طلب السحب الخاص بك (${request.originalTransferNumber}) تلقائيًا بسبب انتهاء المهلة.` }).catch(e => console.error("Error sending stale notification", e));
             }
             delete pendingWithdrawals[key];
         });
