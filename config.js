@@ -1,12 +1,14 @@
 // config.js
 const path = require('path');
 require('dotenv').config(); // Load .env for config variables
-
+let process = require('process');
+// const __dirname = path.dirname(path.resolve()); // Get the root directory of the project
 const ROOT_DIR = __dirname; // Current directory (whatsapp-multi-client-bot)
 const CLIENT_DATA_BASE_DIR = path.join(ROOT_DIR, 'client_data'); // Base directory for all client data
 
 module.exports = {
     QR_WEBSOCKET_PORT: parseInt(process.env.QR_WEBSOCKET_PORT || '8088'),
+    // API_BASE_URL: process.env.API_BASE_URL || 'http://localhost:8080/api',
     API_BASE_URL: process.env.API_BASE_URL || 'http://smartbook.selfip.com:8080/api',
     // Removed API_USERNAME, API_PASSWORD, OWNER_NUMBER from here
     // These will be passed dynamically from C#

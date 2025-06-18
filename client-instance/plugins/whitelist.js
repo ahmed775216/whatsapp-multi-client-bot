@@ -1,252 +1,238 @@
 // client-instance/plugins/whitelist.js
-const fs = require('fs');
-const path = require('path');
-const { jidNormalizedUser } = require('@whiskeysockets/baileys');
+const db = require('../../database/db');
+const { getBotInstanceId } = require('../lib/apiSync');
 
-const DATA_BASE_DIR = process.env.DATA_DIR;
+// Cache for performance
+let whitelistCache = {
+    users: new Set(),
+    groups: new Set(),
+    lastLoaded: 0,
+    cacheTimeout: 60000 // 1 minute
+};
 
-if (!DATA_BASE_DIR) {
-    console.error("[WHITELIST_FATAL] DATA_DIR_FOR_CLIENT environment variable is not set. Whitelist will not function correctly.");
-    // In a production environment, you might want to exit here or throw.
-    // For resilience during dev/testing, we'll try to proceed but expect issues.
+async function loadWhitelistFromDb() {
+    const now = Date.now();
+    if (whitelistCache.lastLoaded && (now - whitelistCache.lastLoaded) < whitelistCache.cacheTimeout) {
+        return; // Use cache
+    }
+
+    const botInstanceId = await getBotInstanceId();
+    if (!botInstanceId) {
+        console.error('[WHITELIST] No bot instance ID found');
+        return;
+    }
+
+    try {
+        // Load users
+        const usersResult = await db.query(
+            'SELECT user_jid FROM whitelisted_users WHERE bot_instance_id = $1 AND api_active = true',
+            [botInstanceId]
+        );
+        whitelistCache.users = new Set(usersResult.rows.map(r => r.user_jid));
+
+        // Load groups
+        const groupsResult = await db.query(
+            'SELECT group_jid FROM whitelisted_groups WHERE bot_instance_id = $1 AND is_active = true',
+            [botInstanceId]
+        );
+        whitelistCache.groups = new Set(groupsResult.rows.map(r => r.group_jid));
+
+        whitelistCache.lastLoaded = now;
+        console.log(`[WHITELIST] Loaded ${whitelistCache.users.size} users and ${whitelistCache.groups.size} groups from database`);
+    } catch (error) {
+        console.error('[WHITELIST] Error loading from database:', error);
+    }
 }
 
-// Ensure DATA_BASE_DIR exists before defining file paths.
-const ensureDataDir = () => {
-    if (!DATA_BASE_DIR) {
-        console.error("[WL_INIT_ERROR] Cannot ensure data directory: DATA_BASE_DIR is undefined.");
-        return false;
-    }
-    if (!fs.existsSync(DATA_BASE_DIR)) {
-        console.log(`[WL_INIT] Data directory ${DATA_BASE_DIR} does not exist, creating.`);
-        try {
-            fs.mkdirSync(DATA_BASE_DIR, { recursive: true });
-            console.log(`[WL_INIT] Created data directory for client at: ${DATA_BASE_DIR}`);
-            return true;
-        } catch (e) {
-            console.error(`[WL_INIT_ERROR] Failed to create data directory ${DATA_BASE_DIR}:`, e.message);
-            return false;
-        }
-    } else {
-        console.log(`[WL_INIT] Data directory ${DATA_BASE_DIR} already exists.`);
-        return true;
-    }
-};
-
-// Immediately ensure data directory when the module is loaded
-ensureDataDir();
-
-const WHITELIST_FILE = path.join(DATA_BASE_DIR, 'whitelist.json');
-const USER_GROUP_PERMISSIONS_FILE = path.join(DATA_BASE_DIR, 'user_group_permissions.json');
-
-
-// --- Initialization Functions ---
-
-const initWhitelistFile = () => {
-    if (!fs.existsSync(WHITELIST_FILE)) {
-        console.log(`[WL_INIT] Whitelist file ${WHITELIST_FILE} does not exist, creating default.`);
-        const defaultWhitelist = { users: [], groups: [], version: 1, lastUpdated: new Date().toISOString() };
-        try {
-            fs.writeFileSync(WHITELIST_FILE, JSON.stringify(defaultWhitelist, null, 2));
-            console.log(`[WL_INIT] Created initial client-specific whitelist.json at ${WHITELIST_FILE}`);
-            return defaultWhitelist;
-        } catch (e) {
-            console.error(`[WL_INIT_ERROR] Failed to write default whitelist.json at ${WHITELIST_FILE}:`, e.message);
-            return { users: [], groups: [] };
-        }
-    }
-    try {
-        const data = fs.readFileSync(WHITELIST_FILE, 'utf8');
-        const parsed = JSON.parse(data);
-        console.log(`[WL_INIT] Successfully loaded whitelist.json from ${WHITELIST_FILE}.`);
-        return { users: parsed.users || [], groups: parsed.groups || [], ...parsed };
-    } catch (error) {
-        console.error(`[WL_INIT_ERROR] Error reading client-specific whitelist.json at ${WHITELIST_FILE}, initializing empty:`, error);
-        return { users: [], groups: [] };
-    }
-};
-
-const initUserGroupPermissionsFile = () => {
-    if (!fs.existsSync(USER_GROUP_PERMISSIONS_FILE)) {
-        console.log(`[WL_INIT] User group permissions file ${USER_GROUP_PERMISSIONS_FILE} does not exist, creating default.`);
-        const defaultPermissions = { permissions: {}, lastUpdated: new Date().toISOString() };
-        try {
-            fs.writeFileSync(USER_GROUP_PERMISSIONS_FILE, JSON.stringify(defaultPermissions, null, 2));
-            console.log(`[WL_INIT] Created initial client-specific user_group_permissions.json at ${USER_GROUP_PERMISSIONS_FILE}`);
-            return defaultPermissions.permissions;
-        } catch (e) {
-            console.error(`[WL_INIT_ERROR] Failed to write default user_group_permissions.json at ${USER_GROUP_PERMISSIONS_FILE}:`, e.message);
-            return {};
-        }
-    }
-    try {
-        const data = fs.readFileSync(USER_GROUP_PERMISSIONS_FILE, 'utf8');
-        const parsed = JSON.parse(data);
-        console.log(`[WL_INIT] Successfully loaded user_group_permissions.json from ${USER_GROUP_PERMISSIONS_FILE}.`);
-        return parsed.permissions || {};
-    } catch (error) {
-        console.error(`[WL_INIT_ERROR] Error reading client-specific user_group_permissions.json at ${USER_GROUP_PERMISSIONS_FILE}, initializing empty:`, error);
-        return {};
-    }
-};
-
-// Global variables should be initialized only once per client instance process
-if (!global.whitelist) {
-    global.whitelist = initWhitelistFile();
-    console.log(`[WL_LOAD] Client-specific: Loaded ${global.whitelist.users.length} users and ${global.whitelist.groups.length} groups.`);
-}
-if (!global.userGroupPermissions) {
-    global.userGroupPermissions = initUserGroupPermissionsFile();
-    console.log(`[WL_LOAD] Client-specific: Loaded group permissions for ${Object.keys(global.userGroupPermissions).length} users.`);
+async function isWhitelisted(jid) {
+    await loadWhitelistFromDb();
+    return whitelistCache.users.has(jid) || whitelistCache.groups.has(jid);
 }
 
-const saveWhitelistFile = () => {
-    try {
-        global.whitelist.lastUpdated = new Date().toISOString();
-        fs.writeFileSync(WHITELIST_FILE, JSON.stringify(global.whitelist, null, 2));
-        console.log(`[WL_SAVE_MAIN] Successfully saved client-specific whitelist.json at ${WHITELIST_FILE}`);
-        return true;
-    } catch (error) {
-        console.error(`[WL_SAVE_MAIN_ERROR] Error saving client-specific whitelist.json at ${WHITELIST_FILE}:`, error.message);
-        return false;
+async function addToWhitelist(jid) {
+    const botInstanceId = await getBotInstanceId();
+    if (!botInstanceId) {
+        return { success: false, reason: 'no_bot_instance' };
     }
-};
 
-const saveUserGroupPermissionsFile = () => {
     try {
-        const dataToSave = { permissions: global.userGroupPermissions, lastUpdated: new Date().toISOString() };
-        fs.writeFileSync(USER_GROUP_PERMISSIONS_FILE, JSON.stringify(dataToSave, null, 2));
-        console.log(`[WL_SAVE_PERM] Successfully saved client-specific user_group_permissions.json at ${USER_GROUP_PERMISSIONS_FILE}`);
-        return true;
+        const isGroup = jid.endsWith('@g.us');
+
+        if (isGroup) {
+            await db.query(`
+                INSERT INTO whitelisted_groups (bot_instance_id, group_jid)
+                VALUES ($1, $2)
+                ON CONFLICT (bot_instance_id, group_jid) 
+                DO UPDATE SET is_active = true, updated_at = CURRENT_TIMESTAMP
+            `, [botInstanceId, jid]);
+            whitelistCache.groups.add(jid);
+        } else {
+            await db.query(`
+                INSERT INTO whitelisted_users (bot_instance_id, user_jid, phone_number)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (bot_instance_id, user_jid) 
+                DO UPDATE SET api_active = true, updated_at = CURRENT_TIMESTAMP
+            `, [botInstanceId, jid, jid.split('@')[0]]);
+            whitelistCache.users.add(jid);
+        }
+        // --- ADD THIS LINE ---
+        whitelistCache.lastLoaded = 0; // Invalidate cache to force a DB reload on next check.
+
+        return { success: true };
     } catch (error) {
-        console.error(`[WL_SAVE_PERM_ERROR] Error saving client-specific user_group_permissions.json at ${USER_GROUP_PERMISSIONS_FILE}:`, error.message);
-        return false;
+        console.error('[WHITELIST] Error adding to whitelist:', error);
+        return { success: false, reason: error.message };
     }
-};
+}
 
-const isWhitelisted = (jid) => {
-    const normalizedJid = jidNormalizedUser(jid);
-    const result = (normalizedJid.endsWith('@s.whatsapp.net') && global.whitelist.users.includes(normalizedJid)) ||
-                   (normalizedJid.endsWith('@g.us') && global.whitelist.groups.includes(normalizedJid));
-    return result;
-};
+async function removeFromWhitelist(jid) {
+    const botInstanceId = await getBotInstanceId();
+    if (!botInstanceId) {
+        return { success: false, reason: 'no_bot_instance' };
+    }
 
-const formatJid = (input) => {
-    // If it's just numbers, assume it's a user and append @s.whatsapp.net
-    if (/^\d+$/.test(input)) return jidNormalizedUser(`${input}@s.whatsapp.net`);
-    // If it's a group JID (digits-timestamp@g.us), return as is after normalizing
-    if (/^\d+-\d+@g\.us$/.test(input)) return jidNormalizedUser(input);
-    // Otherwise, attempt to normalize whatever JID string is given (e.g., handles '1234567890')
-    return jidNormalizedUser(input);
-};
-
-
-const addToWhitelist = (jidOrNumber) => {
     try {
-        const jid = formatJid(jidOrNumber);
-        if (jid.endsWith('@s.whatsapp.net')) {
-            if (!global.whitelist.users.includes(jid)) {
-                global.whitelist.users.push(jid);
-                saveWhitelistFile();
-                console.log(`[WL_ADD] Added user ${jid} to whitelist.`);
-                return { success: true, type: 'user', jid };
-            }
-            console.log(`[WL_ADD] User ${jid} already whitelisted.`);
-            return { success: false, reason: 'already_whitelisted', type: 'user', jid };
-        } else if (jid.endsWith('@g.us')) {
-            if (!global.whitelist.groups.includes(jid)) {
-                global.whitelist.groups.push(jid);
-                saveWhitelistFile();
-                console.log(`[WL_ADD] Added group ${jid} to whitelist.`);
-                return { success: true, type: 'group', jid };
-            }
-            console.log(`[WL_ADD] Group ${jid} already whitelisted.`);
-            return { success: false, reason: 'already_whitelisted', type: 'group', jid };
-        }
-        console.warn(`[WL_ADD] Invalid JID or number format for adding to whitelist: ${jidOrNumber}`);
-        return { success: false, reason: 'invalid_jid_or_number', type: 'unknown', jid };
-    } catch (error) {
-        console.error('[WL_ADD_ERROR] Error in addToWhitelist:', error.message);
-        return { success: false, reason: 'internal_error', type: 'unknown', error: error.message };
-    }
-};
+        const isGroup = jid.endsWith('@g.us');
 
-const removeFromWhitelist = (jidOrNumber) => {
+        if (isGroup) {
+            await db.query(`
+                UPDATE whitelisted_groups 
+                SET is_active = false, updated_at = CURRENT_TIMESTAMP
+                WHERE bot_instance_id = $1 AND group_jid = $2
+            `, [botInstanceId, jid]);
+            whitelistCache.groups.delete(jid);
+        } else {
+            await db.query(`
+                UPDATE whitelisted_users 
+                SET api_active = false, updated_at = CURRENT_TIMESTAMP
+                WHERE bot_instance_id = $1 AND user_jid = $2
+            `, [botInstanceId, jid]);
+            whitelistCache.users.delete(jid);
+        }
+
+        // --- ADD THIS LINE ---
+        whitelistCache.lastLoaded = 0; // Invalidate cache to force a DB reload on next check.
+
+        return { success: true };
+    } catch (error) {
+        console.error('[WHITELIST] Error removing from whitelist:', error);
+        return { success: false, reason: error.message };
+    }
+}
+
+// LID resolution functions using database// This function now looks in bot_contacts
+async function getLidToPhoneJidFromCache(lidJid) {
+    const botInstanceId = await getBotInstanceId();
+    if (!botInstanceId) return null;
+
     try {
-        const jid = formatJid(jidOrNumber);
-        let removed = false;
-        if (jid.endsWith('@s.whatsapp.net')) {
-            const index = global.whitelist.users.indexOf(jid);
-            if (index !== -1) {
-                global.whitelist.users.splice(index, 1);
-                removed = true;
-            }
-        } else if (jid.endsWith('@g.us')) {
-            const index = global.whitelist.groups.indexOf(jid);
-            if (index !== -1) {
-                global.whitelist.groups.splice(index, 1);
-                removed = true;
-            }
-        }
-        if (removed) {
-            saveWhitelistFile();
-            if (jid.endsWith('@s.whatsapp.net')) {
-                // If user is removed from whitelist, remove their specific group permissions too
-                if (global.userGroupPermissions[jid] !== undefined) {
-                    delete global.userGroupPermissions[jid];
-                    saveUserGroupPermissionsFile(); // Ensure this is saved
-                    console.log(`[WL_REMOVE] Removed user ${jid} from whitelist and cleared group permissions.`);
-                } else {
-                    console.log(`[WL_REMOVE] Removed user ${jid} from whitelist. No group permissions to clear.`);
-                }
-            } else {
-                console.log(`[WL_REMOVE] Removed group ${jid} from whitelist.`);
-            }
-            return { success: true, jid };
-        }
-        console.log(`[WL_REMOVE] JID ${jid} not found in whitelist.`);
-        return { success: false, reason: 'not_whitelisted', jid };
+        const result = await db.query(
+            'SELECT user_jid FROM bot_contacts WHERE bot_instance_id = $1 AND lid_jid = $2 AND user_jid IS NOT NULL',
+            [botInstanceId, lidJid]
+        );
+        return result.rows[0]?.user_jid || null;
     } catch (error) {
-        console.error('[WL_REMOVE_ERROR] Error in removeFromWhitelist:', error.message);
-        return { success: false, reason: 'internal_error', error: error.message };
+        console.error('[WHITELIST] Error getting LID resolution from bot_contacts:', error);
+        return null;
     }
-};
+}
 
-const setUserGroupPermission = (userJidOrNumber, allow) => {
+// client-instance/plugins/whitelist.js
+async function cacheLidToPhoneJid(lidJid, phoneJid) { // Removed displayName from parameters, we will fetch it.
+    const botInstanceId = await getBotInstanceId();
+    if (!botInstanceId) return;
+
     try {
-        const userJid = formatJid(userJidOrNumber);
-        if (!userJid.endsWith('@s.whatsapp.net')) {
-            console.warn(`[WL_SET_PERM] Cannot set group permission for non-user JID: ${userJid}`);
-            return { success: false, reason: 'not_a_user_jid' };
-        }
+        const { upsertBotContact, getContactByJid } = require('../../database/botContactsDb');
 
-        // Ensure the user is in the general whitelist before setting group permissions for them
-        // If they are not and `allow` is true, add them.
-        if (!isWhitelisted(userJid) && allow === true) {
-            console.log(`[WL_SET_PERM] User ${userJid} not in general whitelist, auto-adding for group access.`);
-            addToWhitelist(userJid);
-        }
-        
-        // Ensure the structure exists
-        if (!global.userGroupPermissions[userJid] || typeof global.userGroupPermissions[userJid] !== 'object') {
-            global.userGroupPermissions[userJid] = {};
-        }
+        // Step 1: Fetch the existing contact record for the LID to get its name.
+        const lidContact = await getContactByJid(botInstanceId, lidJid);
+        const displayName = lidContact?.display_name || phoneJid.split('@')[0]; // Use existing name or fallback to phone number part
 
-        global.userGroupPermissions[userJid].allowed_in_groups = allow;
-        saveUserGroupPermissionsFile();
-        console.log(`[WL_SET_PERM] Set group permission for ${userJid} to ${allow}.`);
-        return { success: true, jid: userJid, allowed: allow };
+        // Step 2: Now upsert the contact using the phoneJid as the primary key.
+        // This will find the record by name (if it exists) or create a new one.
+        await upsertBotContact(botInstanceId, phoneJid, displayName, displayName);
+
+        // Step 3: Ensure the LID is associated with the updated record.
+        // We find the record by its primary phone JID and update its lid_jid field.
+        await db.query(
+            'UPDATE bot_contacts SET lid_jid = $1 WHERE bot_instance_id = $2 AND user_jid = $3',
+            [lidJid, botInstanceId, phoneJid]
+        );
+
+        console.log(`[WHITELIST] Cached LID resolution in bot_contacts: ${lidJid} -> ${phoneJid}`);
     } catch (error) {
-        console.error('[WL_SET_PERM_ERROR] Error in setUserGroupPermission:', error.message);
-        return { success: false, reason: 'internal_error', error: error.message };
+        console.error('[WHITELIST] Error caching LID resolution in bot_contacts:', error);
     }
-};
+}
+// Update these functions to use database
+async function getPendingLidIdentifications() {
+    const botInstanceId = await getBotInstanceId();
+    if (!botInstanceId) return new Map();
 
+    try {
+        const result = await db.query(
+            'SELECT lid_jid, requested_at FROM pending_lid_identifications WHERE bot_instance_id = $1',
+            [botInstanceId]
+        );
+
+        const map = new Map();
+        result.rows.forEach(row => {
+            map.set(row.lid_jid, new Date(row.requested_at).getTime());
+        });
+        return map;
+    } catch (error) {
+        console.error('[WHITELIST] Error getting pending LID identifications:', error);
+        return new Map();
+    }
+}
+
+async function getAskedLidsCache() {
+    const botInstanceId = await getBotInstanceId();
+    if (!botInstanceId) return new Map();
+
+    try {
+        const result = await db.query(
+            'SELECT lid_jid, asked_at FROM asked_lids_cache WHERE bot_instance_id = $1',
+            [botInstanceId]
+        );
+
+        const map = new Map();
+        result.rows.forEach(row => {
+            map.set(row.lid_jid, new Date(row.asked_at).getTime());
+        });
+        return map;
+    } catch (error) {
+        console.error('[WHITELIST] Error getting asked LIDs cache:', error);
+        return new Map();
+    }
+}
+
+async function savePendingIdsFile() {
+    // No longer needed - database handles persistence
+    return true;
+}
+
+async function saveAskedLidsFile() {
+    // No longer needed - database handles persistence
+    return true;
+}
+
+// Export the functions
 module.exports = {
-    formatJid,
     isWhitelisted,
     addToWhitelist,
     removeFromWhitelist,
-    saveUserGroupPermissionsFile,
-    setUserGroupPermission,
+    getLidToPhoneJidFromCache,
+    cacheLidToPhoneJid,
+    getPendingLidIdentifications,
+    getAskedLidsCache,
+    savePendingIdsFile,
+    saveAskedLidsFile,
+    formatJid: (number) => {
+        if (!number) return null;
+        const cleaned = number.toString().replace(/[^0-9]/g, '');
+        if (cleaned.includes('@')) return cleaned;
+        return cleaned + '@s.whatsapp.net';
+    }
 };

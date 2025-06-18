@@ -1,25 +1,46 @@
 // client-instance/clientBotApp.js
-const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, jidNormalizedUser, areJidsSameUser } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, jidNormalizedUser } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const path = require('path'); // Ensure path is required correctly
 const fs = require('fs');
 const WebSocket = require('ws');
-const withdrawalRequestsPlugin = require('./plugins/withdrawalRequests');
-
-
+const { upsertBotContact, getClientBotInstanceId } = require('../database/botContactsDb');
+let process = require('process');
 const AUTH_DIR = process.env.AUTH_DIR;
 const DATA_DIR = process.env.DATA_DIR;
 const CLIENT_ID = process.env.CLIENT_ID;
+console.log(`[CLIENT_APP_INIT_DEBUG] Instance started with CLIENT_ID from env: '${CLIENT_ID}' (Type: ${typeof CLIENT_ID})`);
 const MANAGER_WS_PORT = parseInt(process.env.MANAGER_WS_PORT || '0');
+// client-instance/clientBotApp.js
 
-if (!AUTH_DIR || !DATA_DIR || !CLIENT_ID || MANAGER_WS_PORT === 0) {
-    console.error(`[${CLIENT_ID}_FATAL] Missing required environment variables. Exiting.`);
+// ... after const MANAGER_WS_PORT = ...
+
+let botInstanceId = null; // <-- ADD THIS
+(async () => { // <-- ADD THIS IIFE WRAPPER
+    try {
+        botInstanceId = await getClientBotInstanceId(CLIENT_ID);
+        if (!botInstanceId) {
+            console.error(`[${CLIENT_ID}_FATAL] Could not retrieve botInstanceId from database on startup. Contact persistence will fail.`);
+        } else {
+            console.log(`[${CLIENT_ID}] Bot Instance ID for contact persistence: ${botInstanceId}`);
+        }
+    } catch (e) {
+        console.error(`[${CLIENT_ID}_FATAL] Database error getting botInstanceId on startup: ${e.message}`);
+    }
+})();
+if (!AUTH_DIR || !DATA_DIR || !CLIENT_ID || MANAGER_WS_PORT === 0) { // Ensure CLIENT_ID here is also checked
+    console.error(`[${CLIENT_ID || 'UNKNOWN_CLIENT'}_FATAL] Missing required environment variables. AUTH_DIR=${AUTH_DIR}, DATA_DIR=${DATA_DIR}, CLIENT_ID=${CLIENT_ID}, MANAGER_WS_PORT=${MANAGER_WS_PORT}. Exiting.`);
     process.exit(1);
 }
 
 if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
+if (!global.pushNameCache) { // كاش لتخزين pushName مؤقتًا
+    global.pushNameCache = new Map();
+}
+
+const botContactsDb = require('../database/botContactsDb'); // Import the new module
 let clientConfig = {};
 const clientConfigPath = path.join(path.dirname(AUTH_DIR), 'client_config.json');
 if (fs.existsSync(clientConfigPath)) {
@@ -36,12 +57,73 @@ process.env.API_PASSWORD_FOR_CLIENT_BOT_LOGIC = clientConfig.apiPassword || proc
 
 const { handleMessage } = require('./handler');
 const { syncWhitelistFromApi } = require('./lib/apiSync');
-const config = require('../config'); // Main project config
+const config = require('../config');
 
 let managerWsClient = null;
 let reconnectManagerWsInterval = null;
-let sock = null; // Make sock accessible in connectToManagerWebSocket scope if needed for immediate actions
-const lidToJidCache = new Map();
+let sock = null;
+// Function to fetch and save contacts (ADD THIS NEW FUNCTION)
+async function fetchAndSaveContacts() {
+    console.log(`[${CLIENT_ID}] Fetching and saving contacts...`);
+    const botInstanceId = await botContactsDb.getClientBotInstanceId(); // Use the local method to get instance ID
+    if (!botInstanceId) {
+        console.error(`[${CLIENT_ID}_CONTACTS_SYNC_ERROR] Could not get bot instance ID for contact sync.`);
+        return;
+    }
+
+    try {
+        // Correctly access contacts. It is typically a Map.
+        // Using `sock.contacts` directly may not contain all contacts.
+        // A more robust way is to listen to 'contacts.update' or use an IQ query.
+        // For initial sync, `sock.store.contacts.all()` might be more reliable
+        // if you are using a store that caches contacts.
+        // However, based on how `sock.contacts` is usually used, it refers to a Map-like structure.
+
+        // Let's assume `sock.contacts` will be a Map once populated.
+        // If it's not yet populated, it might be undefined/null, or an empty Map.
+        const contactsMap = sock.contacts || new Map(); // Initialize as empty Map if null/undefined
+
+        const jidsToKeep = [];
+
+        // Correct way to iterate over a Map
+        console.log(`[${CLIENT_ID}_CONTACTS_SYNC] Processing ${contactsMap.size} contacts.`);
+
+        for (const [jid, contact] of contactsMap.entries()) { // Iterate Map directly
+            // Ensure the JID is valid and a primary JID type if needed, e.g. 's.whatsapp.net'
+            if (!jid || !jid.includes('@') || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) {
+                continue; // Skip group JIDs or invalid JIDs in contact list for bot_contacts
+            }
+
+            const name = contact.name || contact.notify || contact.verifiedName || contact.vname || contact.short || contact.pushName || jid.split('@')[0];
+            const phoneNumber = jid.includes('@s.whatsapp.net') ? jid.split('@')[0] : (contact.number || null);
+
+            jidsToKeep.push(jid);
+
+            await botContactsDb.upsertBotContact(
+                botInstanceId,
+                jid, // This is the contact's JID
+                phoneNumber, // This is the raw phone number (without @s.whatsapp.net)
+                name,
+                contact.pushName // pushName can be stored as whatsapp_name
+            );
+        }
+
+        await botContactsDb.deleteStaleContactsForInstance(botInstanceId, jidsToKeep);
+
+        console.log(`[${CLIENT_ID}_CONTACTS_SYNC] Contacts sync completed. Kept ${jidsToKeep.length} contacts.`);
+
+    } catch (error) {
+        console.error(`[${CLIENT_ID}_CONTACTS_SYNC_ERROR] Error fetching or saving contacts: ${error.message}`, error.stack);
+        // Added explicit TypeError check, as the `contacts = await sock.contacts` line can throw an error
+        // if `sock` itself is undefined/null before `connection.update` 'open'
+        if (error instanceof TypeError && error.message.includes('Cannot convert undefined or null to object')) {
+            console.error(`[${CLIENT_ID}_CONTACTS_SYNC_ERROR] Likely, sock.contacts was not ready. Ensure this runs AFTER WhatsApp connection is 'open'.`);
+        }
+    }
+}
+
+
+
 function connectToManagerWebSocket() {
     if (reconnectManagerWsInterval) {
         clearInterval(reconnectManagerWsInterval);
@@ -52,10 +134,18 @@ function connectToManagerWebSocket() {
 
     managerWsClient.onopen = () => {
         console.log(`[${CLIENT_ID}] Connected to manager WS.`);
-        reportStatusToManager('status', {
+        reportToManager('status', {
             status: 'connecting_whatsapp', // More specific initial status
             message: `Client ${CLIENT_ID} bot instance started, attempting WhatsApp connection.`,
         });
+        startClientBot().catch(err => {
+            console.error(`[${CLIENT_ID}] Critical Error starting client bot:`, err.message, err.stack);
+            reportToManager('status', {
+                status: 'error_startup', message: `Client bot ${CLIENT_ID} failed to start: ${err.message}`,
+            });
+            process.exit(1);
+        });
+
     };
 
     managerWsClient.onmessage = async (event) => {
@@ -86,32 +176,42 @@ function connectToManagerWebSocket() {
                     command: parsedMsg.command,
                     groupId: parsedMsg.groupId,
                     participantJid: parsedMsg.participantJid,
+                    lid: parsedMsg.lid, // ADDED: Pass lid to handler
+                    phoneJid: parsedMsg.phoneJid, // ADDED: Pass phoneJid to handler
                     clientId: CLIENT_ID,
                 });
             } else if (parsedMsg.clientId === CLIENT_ID) {
-                console.log(`[${CLIENT_ID}] Manager message (type: ${parsedMsg.type}): ${event.data.toString().substring(0, 150)}`); // Can be noisy
+                // console.log(`[${CLIENT_ID}] Manager message (type: ${parsedMsg.type}): ${event.data.toString().substring(0,150)}`); // Can be noisy
             } else if (parsedMsg.type !== 'internalCommand') { // General messages not for this client specifically
-                console.log(`[${CLIENT_ID}] Received general manager message: ${event.data.toString().substring(0, 100)}`);
+                // console.log(`[${CLIENT_ID}] Received general manager message: ${event.data.toString().substring(0,100)}`);
             }
         } catch (error) {
             console.error(`[${CLIENT_ID}] Error processing manager message: ${error.message}. Raw: ${event.data.toString().substring(0, 200)}`);
         }
     };
 
+    // In clientBotApp.js, update the reconnection logic:
     managerWsClient.onclose = () => {
         console.log(`[${CLIENT_ID}] Disconnected from manager WS. Attempting to reconnect...`);
-        reportStatusToManager('status', { status: 'disconnected_manager_ws', message: `Client ${CLIENT_ID} lost connection to manager.` });
-        if (!reconnectManagerWsInterval) {
-            reconnectManagerWsInterval = setInterval(() => {
-                if (!managerWsClient || managerWsClient.readyState === WebSocket.CLOSED || managerWsClient.readyState === WebSocket.CLOSING) {
-                    console.log(`[${CLIENT_ID}] Retrying manager WS connection...`);
-                    connectToManagerWebSocket();
-                } else {
-                    clearInterval(reconnectManagerWsInterval); // Clear if somehow connected
-                    reconnectManagerWsInterval = null;
-                }
-            }, 5000);
+        reportToManager('status', { status: 'disconnected_manager_ws', message: `Client ${CLIENT_ID} lost connection to manager.` });
+
+        // Clear any existing interval first
+        if (reconnectManagerWsInterval) {
+            clearInterval(reconnectManagerWsInterval);
+            reconnectManagerWsInterval = null;
         }
+
+        // Set up reconnection with proper check
+        reconnectManagerWsInterval = setInterval(() => {
+            if (!managerWsClient || managerWsClient.readyState === WebSocket.CLOSED || managerWsClient.readyState === WebSocket.CLOSING) {
+                console.log(`[${CLIENT_ID}] Retrying manager WS connection...`);
+                connectToManagerWebSocket();
+            } else if (managerWsClient.readyState === WebSocket.OPEN) {
+                // Already connected, clear the interval
+                clearInterval(reconnectManagerWsInterval);
+                reconnectManagerWsInterval = null;
+            }
+        }, 5000);
     };
 
     managerWsClient.onerror = (error) => {
@@ -120,22 +220,34 @@ function connectToManagerWebSocket() {
     };
 }
 
-function reportStatusToManager(type, data = {}) {
+function reportToManager(type, data = {}) { // تغيير اسم الدالة ليكون عامًا أكثر
     if (managerWsClient && managerWsClient.readyState === WebSocket.OPEN) {
         const payload = { type: type, clientId: CLIENT_ID, data: data };
         try {
             managerWsClient.send(JSON.stringify(payload));
+            console.log(`[${CLIENT_ID}] Reported to manager: type=${type}, data keys: ${Object.keys(data).join(', ')}`);
         } catch (e) {
-            console.error(`[${CLIENT_ID}] Error sending status to manager: `, e.message);
+            console.error(`[${CLIENT_ID}] Error sending to manager (type: ${type}): `, e.message);
         }
     } else {
-        console.warn(`[${CLIENT_ID}] Manager WS not open, cannot report ${type}.`); // Can be noisy
+        console.warn(`[${CLIENT_ID}] Manager WS not open, cannot report ${type}.`);
     }
 }
 
+// دالة جديدة لإرسال تحديث حل @lid
+function reportLidResolution(originalLid, resolvedPhoneJid, pushName) {
+    reportToManager('lidResolved', {
+        originalLid: originalLid,
+        resolvedPhoneJid: resolvedPhoneJid,
+        displayName: pushName // استخدام pushName كاسم عرض
+    });
+}
+module.exports = { reportLidResolution }; // تصدير الدالة
+
+
 async function startClientBot() {
     console.log(`[${CLIENT_ID}] Initializing Baileys connection...`);
-    reportStatusToManager('status', { status: 'initializing_baileys', message: `Client ${CLIENT_ID} initializing WhatsApp.` });
+    // reportToManager('status', { status: 'initializing_baileys', message: `Client ${CLIENT_ID} initializing WhatsApp.` });
 
 
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
@@ -143,25 +255,21 @@ async function startClientBot() {
 
     sock = makeWASocket({ // Assign to the higher-scoped sock
         version,
-        logger: pino({ level: process.env.LOG_LEVEL || 'silent' }), // Default to silent to reduce noise
+        logger: pino({ level: process.env.LOG_LEVEL }), // Default to silent to reduce noise
         auth: state,
         browser: [`Client-${CLIENT_ID.substring(0, 10)}`, 'Chrome', '1.0'],
         printQRInTerminal: false, // We send QR to manager
         // SyncFullHistory: false, // Consider disabling if not needed for performance
         // ConnectTimeoutMs: 60000, // Longer timeout
     });
-    if (withdrawalRequestsPlugin.init) {
-        withdrawalRequestsPlugin.init(sock);
-    }
 
     sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr, receivedPendingNotifications, isOnline, isNewLogin } = update;
-        console.log(`[${CLIENT_ID}_CONN_UPDATE] Connection: ${connection}, QR: ${!!qr}, LastDisconnect: ${lastDisconnect?.error?.message}, StatusCode: ${lastDisconnect?.error?.output?.statusCode}, ReceivedPending: ${receivedPendingNotifications}, IsOnline: ${isOnline}, IsNewLogin: ${isNewLogin}`);
+        const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
             console.log(`[${CLIENT_ID}] New QR code received. Reporting to manager.`);
-            reportStatusToManager('qr', qr); // Send QR data (string)
-            reportStatusToManager('status', { status: 'qr_received', message: `Client ${CLIENT_ID} QR ready. Scan needed.` });
+            reportToManager('qr', qr); // Send QR data (string)
+            reportToManager('status', { status: 'qr_received', message: `Client ${CLIENT_ID} QR ready. Scan needed.` });
         }
 
         if (connection === 'close') {
@@ -169,47 +277,32 @@ async function startClientBot() {
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             const reason = DisconnectReason[statusCode] || `Unknown (${statusCode})`;
             console.log(`[${CLIENT_ID}] WhatsApp connection closed. Reason: ${reason}. Should Reconnect: ${shouldReconnect}`);
-            reportStatusToManager('status', { status: 'disconnected_whatsapp', message: `Client ${CLIENT_ID} disconnected from WhatsApp (${reason}).` });
-            if (statusCode === DisconnectReason.badSession) {
-                console.error(`[${CLIENT_ID}] Bad session file. Clearing auth directory and requesting new QR.`);
-                try {
-                    if (fs.existsSync(AUTH_DIR)) {
-                        fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-                        console.log(`[${CLIENT_ID}] Successfully cleared auth directory due to bad session.`);
-                    }
-                    // إعلام المدير بأن هناك حاجة إلى QR جديد (قد يتطلب تعديل في كيفية إرسال هذه الحالة للمدير)
-                    reportStatusToManager('status', { status: 'error_bad_session', message: `Client ${CLIENT_ID} has a bad session. Please relink.` });
-                    // يجب أن تتوقف العملية هنا أو أن تنتظر أمرًا جديدًا للربط من المدير
-                    // قد لا يكون استدعاء startClientBot() مباشرة هو الحل الأمثل هنا
-                    // لأنها ستستمر في المحاولة بجلسة فارغة.
-                    // الأفضل هو أن يتخذ المدير إجراءً (مثل إيقاف وإعادة تشغيل مع forceNewScan إذا لزم الأمر).
-                    process.exit(1); // أو أي رمز خطأ يشير إلى الحاجة لتدخل
-                } catch (e) {
-                    console.error(`[${CLIENT_ID}_ERROR] Failed to clear auth directory for bad session:`, e);
-                }
-            } else if (statusCode === DisconnectReason.loggedOut) {
+            reportToManager('status', { status: 'disconnected_whatsapp', message: `Client ${CLIENT_ID} disconnected from WhatsApp (${reason}).` });
+
+
+            if (statusCode === DisconnectReason.loggedOut) {
                 console.log(`[${CLIENT_ID}] Logged out by WhatsApp. Clearing auth and exiting.`);
                 try { if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (e) { console.error(`[${CLIENT_ID}] Error cleaning auth dir:`, e.message); }
-                reportStatusToManager('status', { status: 'disconnected_logout', message: `Client ${CLIENT_ID} logged out by WhatsApp.` });
+                reportToManager('status', { status: 'disconnected_logout', message: `Client ${CLIENT_ID} logged out by WhatsApp.` });
                 process.exit(0); // Exit cleanly
             } else if (shouldReconnect) {
                 console.log(`[${CLIENT_ID}] Attempting to reconnect to WhatsApp in 5s...`);
-                reportStatusToManager('status', { status: 'reconnecting_whatsapp', message: `Client ${CLIENT_ID} reconnecting to WhatsApp...` });
+                reportToManager('status', { status: 'reconnecting_whatsapp', message: `Client ${CLIENT_ID} reconnecting to WhatsApp...` });
                 setTimeout(() => startClientBot(), config.RECONNECT_DELAY_MS); // Use configured delay
             } else {
                 console.error(`[${CLIENT_ID}] Unrecoverable WhatsApp connection error. Error: ${lastDisconnect?.error?.message}`);
-                reportStatusToManager('status', { status: 'error_whatsapp_permanent', message: `Client ${CLIENT_ID} permanent WhatsApp connection error.` });
+                reportToManager('status', { status: 'error_whatsapp_permanent', message: `Client ${CLIENT_ID} permanent WhatsApp connection error.` });
                 process.exit(1); // Exit with error
             }
         } else if (connection === 'open') {
             const phoneNumber = jidNormalizedUser(sock.user?.id || '').split('@')[0];
             const clientName = sock.user?.name || `Client-${phoneNumber || CLIENT_ID.substring(0, 10)}`;
             console.log(`[${CLIENT_ID}] Connected to WhatsApp! Phone: ${phoneNumber}, Name: ${clientName}`);
-            reportStatusToManager('status', {
-                status: 'connected', message: `Client ${phoneNumber || CLIENT_ID} connected to WhatsApp.`,
+            reportToManager('status', {
+                status: 'connected_whatsapp', message: `Client ${phoneNumber || CLIENT_ID} connected to WhatsApp.`,
                 phoneNumber: phoneNumber, name: clientName,
             });
-
+            // await fetchAndSaveContacts();
             if (!config.SKIP_API_SYNC_ON_RECONNECT || !global.initialApiSyncDone) { // Allow skipping if configured
                 console.log(`[${CLIENT_ID}] Starting API sync for client-specific whitelist.`);
                 await syncWhitelistFromApi();
@@ -220,117 +313,107 @@ async function startClientBot() {
 
         } else if (connection === 'connecting') {
             console.log(`[${CLIENT_ID}] WhatsApp connecting...`);
-            reportStatusToManager('status', { status: 'connecting_whatsapp', message: `Client ${CLIENT_ID} connecting to WhatsApp...` });
-        }
-        // عند الاتصال، حاول ملء الذاكرة المؤقتة من جهات الاتصال الحالية (إذا كانت متوفرة)
-        // هذه الخطوة اختيارية وقد تكون ثقيلة إذا كان هناك عدد كبير جداً من جهات الاتصال.
-        // الاعتماد على 'contacts.upsert' أكثر فعالية للتحديثات المستمرة.
-        if (sock.contacts) { // Check if sock.contacts is available and populated
-            let initialCacheCount = 0;
-            for (const jid in sock.contacts) {
-                const contact = sock.contacts[jid];
-                if (contact.id && contact.lid && contact.lid.user) {
-                    const normalizedJid = jidNormalizedUser(contact.id);
-                    const normalizedLid = jidNormalizedUser(`${contact.lid.user}@lid`);
-                    if (normalizedJid.endsWith('@s.whatsapp.net')) {
-                        lidToJidCache.set(normalizedLid, normalizedJid);
-                        initialCacheCount++;
-                    }
-                }
-            }
-            if (initialCacheCount > 0) {
-                console.log(`[${CLIENT_ID}_CACHE] Initialized LID-JID cache with ${initialCacheCount} contacts from sock.contacts. Cache size: ${lidToJidCache.size}`);
-            }
+            reportToManager('status', { status: 'connecting_whatsapp', message: `Client ${CLIENT_ID} connecting to WhatsApp...` });
         }
     });
 
     sock.ev.on('creds.update', saveCreds);
 
+    // client-instance/clientBotApp.js
+
     sock.ev.on('messages.upsert', async (upsert) => {
         if (upsert.type !== 'notify') return;
-        console.log(`[${CLIENT_ID}] Received ${upsert.messages.length} new messages.`); // Can be very noisy
+
         for (const m of upsert.messages) {
-            if (!m.key.fromMe) { // Process only incoming messages, not self-sent for commands
-                //  await handleMessage(sock, m, { clientId: CLIENT_ID });
-                // ---> مرر الذاكرة المؤقتة إلى معالج الرسائل
-                await handleMessage(sock, m, { clientId: CLIENT_ID, lidToJidCache: lidToJidCache });
-            }
-        }
+            const senderJid = jidNormalizedUser(m.key.participant || m.key.remoteJid);
+            const pushName = m.pushName;
 
-    });
-    sock.ev.on('contacts.upsert', (contacts) => {
-        for (const contact of contacts) {
-            if (contact.id && contact.lid && contact.lid.user) { // تأكد من وجود JID و LID
-                const jid = jidNormalizedUser(contact.id);
-                const lid = jidNormalizedUser(`${contact.lid.user}@lid`); // توحيد صيغة LID
-                if (jid.endsWith('@s.whatsapp.net')) { // تأكد أنه JID مستخدم وليس مجموعة
-                    lidToJidCache.set(lid, jid);
-                    // يمكنك أيضًا إنشاء jidToLidCache إذا احتجت للبحث العكسي
-                    console.log(`[${CLIENT_ID}_CACHE] Cached LID ${lid} -> JID ${jid}`);
-                }
+            // Update the temporary cache for immediate use
+            if (senderJid && pushName && pushName !== "UnknownPN") {
+                global.pushNameCache.set(senderJid, pushName);
+            }
+
+            // client-instance/clientBotApp.js -> inside 'messages.upsert' handler
+
+            // **Persist the learned name to the database**
+            if (botInstanceId && senderJid && pushName && pushName !== "UnknownPN") {
+                // This is a "fire-and-forget" call for performance.
+                upsertBotContact(
+                    botInstanceId,
+                    senderJid,
+                    pushName,      // displayName
+                    pushName       // whatsappName
+                ).catch(e => console.error(`[${CLIENT_ID}] Background contact upsert failed for ${senderJid}: ${e.message}`));
+            }
+
+            if (!m.key.fromMe) {
+                await handleMessage(sock, m, { clientId: CLIENT_ID });
             }
         }
-        if (contacts.length > 0) {
-            console.log(`[${CLIENT_ID}_CACHE] Updated LID-JID cache with ${contacts.length} contacts. Cache size: ${lidToJidCache.size}`);
+    });
+    // NEW: Listen for when contacts are first populated or updated by Baileys store
+    // This is the more reliable way to know when contacts are ready.
+    let initialContactsSet = false; // Flag to ensure initial sync runs only once per session
+    sock.ev.on('contacts.set', async ({ contacts }) => {
+        console.log(`[${CLIENT_ID}] contacts.set event received. Total: ${contacts.length}. Initial sync: ${!initialContactsSet}`);
+        // If this is the initial full set of contacts, or a subsequent large update.
+        // We'll run fetchAndSaveContacts when a full set is received.
+        if (!initialContactsSet) {
+            console.log(`[${CLIENT_ID}] Running initial contact sync due to contacts.set event.`);
+            await fetchAndSaveContacts();
+            initialContactsSet = true;
+        }
+        // If you want to continuously update on every contact change, you'd call fetchAndSaveContacts() here
+        // or process 'contacts.update' which streams individual changes.
+        // For now, this `contacts.set` listener for the initial big sync is good.
+    });
+
+    sock.ev.on('contacts.update', async updates => {
+        // This fires for individual contact updates (e.g., someone changes their name)
+        // If you want to keep contacts highly synchronized, you'd handle granular updates here.
+        // For simplicity and initial implementation, contacts.set handles the full sync.
+        console.log(`[${CLIENT_ID}] contacts.update event received for ${updates.length} contacts.`);
+        // For now, let's trigger a full refresh on any update, as it's easier than granular updates.
+        // For production, you might want to process `updates` more efficiently.
+        if (sock.contacts && Object.keys(sock.contacts).length > 0) { // Only re-sync if contacts are generally available
+            console.log(`[${CLIENT_ID}] Re-syncing contacts due to update event.`);
+            await fetchAndSaveContacts();
         }
     });
+
+    // Fallback: Sometimes contacts.set doesn't fire immediately, or if the bot restarts mid-session.
+    // Add a small delay after 'open' for initial contacts to load, then run a check.
+    // This provides a safety net if contacts.set isn't reliably triggered for initial load.
+    if (!initialContactsSet) {
+        console.log(`[${CLIENT_ID}] Scheduling a delayed fallback contact sync...`);
+        setTimeout(async () => {
+            if (!initialContactsSet) { // Only run if contacts.set hasn't triggered it yet
+                console.log(`[${CLIENT_ID}] Running delayed fallback contact sync.`);
+                await fetchAndSaveContacts();
+                initialContactsSet = true;
+            }
+        }, 10000); 4
+    }
 }
-
 // --- Main Execution ---
 connectToManagerWebSocket(); // Connect to manager first
-startClientBot().catch(err => {
-    console.error(`[${CLIENT_ID}] Critical Error starting client bot:`, err.message, err.stack);
-    reportStatusToManager('status', {
-        status: 'error_startup', message: `Client bot ${CLIENT_ID} failed to start: ${err.message}`,
-    });
-    process.exit(1);
-});
-let isShuttingDown = false; // متغير لمنع عمليات الإغلاق المتعددة
+// startClientBot().catch(err => {
+//     console.error(`[${CLIENT_ID}] Critical Error starting client bot:`, err.message, err.stack);
+//     reportToManager('status', {
+//         status: 'error_startup', message: `Client bot ${CLIENT_ID} failed to start: ${err.message}`,
+//     });
+//     process.exit(1);
+// });
 
-const gracefulShutdown = async (signal) => {
-console.log(`!!!!!!!!!!!!!!!!!!!!!!!! [${CLIENT_ID}] GRACEFUL SHUTDOWN CALLED WITH SIGNAL: ${signal} !!!!!!!!!!!!!!!!!!!!!!!!`); // <<-- سجل واضح جدًا
-    if (isShuttingDown) {
-        console.log(`[${CLIENT_ID}] Shutdown already in progress, ignoring duplicate ${signal}.`);
-        return;
-    }
-    isShuttingDown = true;
-
-    console.log(`[${CLIENT_ID}] Received ${signal}. Initiating graceful shutdown...`);
-
-    // 1. إيقاف أي عمليات دورية (مثل polling)
-    if (withdrawalRequestsPlugin && withdrawalRequestsPlugin.stopPollingOnShutdown) {
-        withdrawalRequestsPlugin.stopPollingOnShutdown();
-        console.log(`[${CLIENT_ID}] Polling stopped.`);
-    }
-
-    // 2. حفظ أي حالة معلقة (مثل pendingWithdrawals)
-    if (withdrawalRequestsPlugin && withdrawalRequestsPlugin.savePendingOnShutdown) {
-        try {
-            await withdrawalRequestsPlugin.savePendingOnShutdown(); // افترض أنها قد تكون async
-            console.log(`[${CLIENT_ID}] Pending state saved.`);
-        } catch (e) {
-            console.error(`[${CLIENT_ID}_ERROR] Failed to save pending state during shutdown:`, e);
-        }
-    }
-
-    try {
-        if (sock) {
-            console.log(`[${CLIENT_ID}] Attempting to call sock.end()...`);
-            sock.end(new Error(`Shutdown on ${signal}`));
-            console.log(`[${CLIENT_ID}] sock.end() called.`);
-        }
-    } catch (e) {
-        console.error(`[${CLIENT_ID}_SHUTDOWN_ERROR] Error during sock.end():`, e);
-    }
-
-    // 5. إعطاء مهلة قصيرة جداً لعمليات الحفظ والكتابة غير المتزامنة المحتملة
-    //    قبل إنهاء العملية بشكل قسري.
-    //    دالة saveCreds من Baileys هي غير متزامنة.
-setTimeout(() => {
-    console.log(`[${CLIENT_ID}] Graceful shutdown timeout reached. Exiting.`);
+process.on('SIGINT', () => {
+    console.log(`[${CLIENT_ID}] SIGINT received, shutting down...`);
+    if (sock) sock.end(new Error('SIGINT Shutdown'));
+    if (managerWsClient) managerWsClient.close();
     process.exit(0);
-}, 5000);  // زد هذه القيمة إذا لزم الأمر، ولكن لا تجعلها طويلة جدًا
-};
-
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+});
+process.on('SIGTERM', () => {
+    console.log(`[${CLIENT_ID}] SIGTERM received, shutting down...`);
+    if (sock) sock.end(new Error('SIGTERM Shutdown'));
+    if (managerWsClient) managerWsClient.close();
+    process.exit(0);
+});

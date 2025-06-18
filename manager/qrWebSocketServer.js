@@ -1,22 +1,23 @@
 // manager/qrWebSocketServer.js
 const WebSocket = require('ws');
+const clientRegistry = require('./clientRegistry');
 
 let wss = null;
-let csharpClientWs = null;
-const clientBotWsMap = new Map(); // Maps clientId to WebSocket connection of the bot instance
-
+const csharpUiClients = new Set();
+const clientBotWsMap = new Map();
+const csharpClientWsMap = new Map();
+let process = require('process');
 let managerQrState = {
     qr: null,
-    status: 'disconnected',
+    status: 'disconnected', // Overall status of any ongoing linking process
     message: 'Waiting for linking attempt...',
-    linkingClientId: null
+    linkingClientId: null // The clientId of the bot instance currently being linked (requested by any UI)
 };
 
 // Callbacks (assigned from manager.js)
 let onQrRequestedCallback = null;
 let onManualRelinkCallback = null;
-let onIncomingClientStatusCallback = null;
-let onIncomingClientQrCallback = null;
+let onIncomingClientDataCallback = null;
 let onListInstancesCallback = null;
 let onStartInstanceCallback = null;
 let onStopInstanceCallback = null;
@@ -27,13 +28,13 @@ let onFetchGroupsCallback = null;
 let onAddChatToWhitelistCallback = null;
 let onRemoveFromChatWhitelistCallback = null;
 let onFetchParticipantsCallback = null;
-
+let onManualLidEntryCallback = null;
 
 function startWebSocketServer(port, callbacks = {}) {
+    // Assign callbacks from manager.js
     onQrRequestedCallback = callbacks.onQrRequested;
     onManualRelinkCallback = callbacks.onManualRelink;
-    onIncomingClientStatusCallback = callbacks.onIncomingClientStatus;
-    onIncomingClientQrCallback = callbacks.onIncomingClientQr;
+    onIncomingClientDataCallback = callbacks.onIncomingClientData;
     onListInstancesCallback = callbacks.onListInstances;
     onStartInstanceCallback = callbacks.onStartInstance;
     onStopInstanceCallback = callbacks.onStopInstance;
@@ -44,8 +45,12 @@ function startWebSocketServer(port, callbacks = {}) {
     onAddChatToWhitelistCallback = callbacks.onAddChatToWhitelist;
     onRemoveFromChatWhitelistCallback = callbacks.onRemoveFromChatWhitelist;
     onFetchParticipantsCallback = callbacks.onFetchParticipants;
+    onManualLidEntryCallback = callbacks.onManualLidEntry; // Assign the manualLidEntry callback
 
-    if (wss) { console.warn("[MGR_QR_WS] WebSocket server already running."); return; }
+    if (wss) { 
+        console.warn("[MGR_QR_WS] WebSocket server already running."); 
+        return; 
+    }
 
     wss = new WebSocket.Server({ port: port, host: '0.0.0.0' });
     console.log(`[MGR_QR_WS] WebSocket server for QR started on port ${port} and binding to 0.0.0.0`);
@@ -55,84 +60,122 @@ function startWebSocketServer(port, callbacks = {}) {
         console.log(`[MGR_QR_WS] Incoming connection from ${clientIP}.`);
 
         const initialMessageHandler = (message) => {
-            ws.removeListener('message', initialMessageHandler); // Process only the first message with this handler
-
+            ws.removeListener('message', initialMessageHandler);
             const msgStr = message.toString();
+
             let parsedMsg;
-            try { parsedMsg = JSON.parse(msgStr); }
+            try {
+                parsedMsg = JSON.parse(msgStr);
+                if (parsedMsg.type && typeof parsedMsg.type === 'string') {
+                    parsedMsg.type = parsedMsg.type.trim();
+                }
+            }
             catch (e) {
-                console.error('[MGR_QR_WS] Error parsing initial message, closing connection:', e.message);
-                ws.close(1008, "Invalid initial message format"); return;
+                console.error(`[MGR_QR_WS_ERROR] Error parsing initial message from ${clientIP}, closing connection: ${e.message}. Raw: ${msgStr.substring(0, 250)}`);
+                ws.close(1008, "Invalid initial message format"); 
+                return;
             }
 
-            // Identify C# UI client
-            if (parsedMsg.type === 'requestQr' || parsedMsg.type === 'manualRelink' ||
-                parsedMsg.type === 'listInstances' || parsedMsg.type === 'startInstance' ||
-                parsedMsg.type === 'stopInstance' || parsedMsg.type === 'restartInstance' ||
-                parsedMsg.type === 'deleteInstance' || parsedMsg.type === 'getLogs' ||
-                parsedMsg.type === 'fetchGroups' || parsedMsg.type === 'addChatToWhitelist' ||
-                parsedMsg.type === 'removeFromChatWhitelist' || parsedMsg.type === 'fetchParticipants')
-            {
-                if (csharpClientWs && csharpClientWs.readyState === WebSocket.OPEN && csharpClientWs !== ws) {
-                    console.warn(`[MGR_QR_WS] Another C# UI client (${clientIP}) attempted to connect. Closing extra.`);
-                    ws.close(1008, "Only one UI client allowed"); return;
-                }
-                csharpClientWs = ws;
-                console.log(`[MGR_QR_WS] Designated C# UI client connected from ${clientIP}.`);
-                csharpClientWs.send(JSON.stringify({ type: 'status', ...managerQrState }));
-                handleCSharpUiCommand(ws, parsedMsg); // Process the initial command
-                ws.on('message', (subsequentMessage) => {
-                    try {
-                        handleCSharpUiCommand(ws, JSON.parse(subsequentMessage.toString()));
-                    } catch (jsonErr) {
-                        console.error(`[MGR_QR_WS_ERROR] C# UI Subsequent message JSON parse error: ${jsonErr.message}. Raw: ${subsequentMessage.toString().substring(0,100)}`);
+            if (!parsedMsg || typeof parsedMsg.type !== 'string') {
+                console.warn(`[MGR_QR_WS] Parsed message or its type is invalid from ${clientIP}. Msg content: ${msgStr.substring(0, 100)}. Closing.`);
+                ws.close(1008, "Invalid message structure or type");
+                return;
+            }
+
+            const csharpCommandTypes = [
+                'requestQr', 'manualRelink', 'listInstances', 'startInstance',
+                'stopInstance', 'restartInstance', 'deleteInstance', 'getLogs',
+                'fetchGroups', 'addChatToWhitelist', 'removeFromChatWhitelist', 'fetchParticipants',
+                'manualLidEntry' // Include manualLidEntry in the list of C# command types
+            ];
+            const botDataMessageTypes = ['status', 'qr', 'lidResolved'];
+            const botInternalReplyType = 'internalReply';
+
+            if (csharpCommandTypes.includes(parsedMsg.type)) {
+                // Handle C# UI client connection
+                if (!csharpUiClients.has(ws)) {
+                    csharpUiClients.add(ws);
+                    // If csharpClientId is provided, map it to this WebSocket
+                    const csharpClientId = parsedMsg.csharpClientId;
+                    if (csharpClientId) {
+                        csharpClientWsMap.set(csharpClientId, ws);
+                        console.log(`[MGR_QR_WS] C# UI client '${csharpClientId}' connected from ${clientIP} and added to active set. Total UI clients: ${csharpUiClients.size}`);
+                        // Update last seen timestamp
+                        clientRegistry.updateClientLastSeen(csharpClientId);
+                    } else {
+                        console.log(`[MGR_QR_WS] C# UI client connected from ${clientIP} and added to active set. Total UI clients: ${csharpUiClients.size}`);
                     }
-                });
-            }
-            // Identify Node.js Client Bot Instance
-            else if (parsedMsg.clientId && (parsedMsg.type === 'status' || parsedMsg.type === 'qr' || parsedMsg.type === 'internalReply'))
-            {
-                const { clientId } = parsedMsg; // clientId is at top level of parsedMsg
-                const dataPayload = parsedMsg.data; // The actual content (QR string, status object) is in parsedMsg.data
-
-                if (!clientBotWsMap.has(clientId) || clientBotWsMap.get(clientId) !== ws) {
-                    console.log(`[MGR_QR_WS] Client Bot Instance ${clientId} connected from ${clientIP}.`);
-                    clientBotWsMap.set(clientId, ws);
+                    
+                    // Send current status to the newly connected client
+                    sendToClient(ws, { type: 'status', ...managerQrState });
+                    if (callbacks.onListInstances) {
+                        callbacks.onListInstances(ws);
+                    }
                 }
-
-                // Process the initial message from the bot using its data payload
-                if (parsedMsg.type === 'status' && onIncomingClientStatusCallback) {
-                    onIncomingClientStatusCallback(clientId, dataPayload);
-                } else if (parsedMsg.type === 'qr' && onIncomingClientQrCallback) {
-                    onIncomingClientQrCallback(clientId, dataPayload); // dataPayload here is the QR string
-                } else if (parsedMsg.type === 'internalReply') {
-                    handleClientBotInternalReply(clientId, parsedMsg); // Pass the whole parsedMsg for internalReply
-                }
-
-                // Set up listener for SUBSEQUENT messages from this bot instance
+                
+                // Process the command
+                handleCSharpUiCommand(ws, parsedMsg);
+                
+                // Set up handlers for subsequent messages
                 ws.on('message', (subsequentMessage) => {
                     try {
                         const subParsedMsg = JSON.parse(subsequentMessage.toString());
-                        if (subParsedMsg.clientId === clientId) { // Ensure message is from the expected client
-                            const subDataPayload = subParsedMsg.data; // Content is in subParsedMsg.data
-                            if (subParsedMsg.type === 'status' && onIncomingClientStatusCallback) {
-                                onIncomingClientStatusCallback(clientId, subDataPayload);
-                            } else if (subParsedMsg.type === 'qr' && onIncomingClientQrCallback) {
-                                onIncomingClientQrCallback(clientId, subDataPayload); // subDataPayload is the QR string
-                            } else if (subParsedMsg.type === 'internalReply') {
-                                handleClientBotInternalReply(clientId, subParsedMsg);
-                            } else {
-                                console.warn(`[MGR_QR_WS] Unhandled subsequent message type ${subParsedMsg.type} from bot ${clientId}. Raw: ${subsequentMessage.toString().substring(0,100)}`);
-                            }
+                        if (subParsedMsg.csharpClientId) {
+                            clientRegistry.updateClientLastSeen(subParsedMsg.csharpClientId);
+                        }
+                        if (subParsedMsg.type && typeof subParsedMsg.type === 'string') {
+                            handleCSharpUiCommand(ws, subParsedMsg);
                         } else {
-                             console.warn(`[MGR_QR_WS] Subsequent message clientId mismatch. Expected ${clientId}, got ${subParsedMsg.clientId}. Raw: ${subsequentMessage.toString().substring(0,100)}`);
+                            console.warn(`[MGR_QR_WS_WARN] C# UI Subsequent message invalid type from ${clientIP}. Raw: ${subsequentMessage.toString().substring(0, 100)}`);
                         }
                     } catch (jsonErr) {
-                        console.error(`[MGR_QR_WS_ERROR] Bot subsequent message JSON parse error: ${jsonErr.message}. Raw: ${subsequentMessage.toString().substring(0,100)}`);
+                        console.error(`[MGR_QR_WS_ERROR] C# UI Subsequent message JSON parse error from ${clientIP}: ${jsonErr.message}. Raw: ${subsequentMessage.toString().substring(0, 100)}`);
+                    }
+                });
+            }
+            else if (parsedMsg.clientId && (botDataMessageTypes.includes(parsedMsg.type) || parsedMsg.type === botInternalReplyType)) {
+                // Handle bot client connection
+                const { clientId, type, data: dataPayload } = parsedMsg;
+
+                if (!clientBotWsMap.has(clientId) || clientBotWsMap.get(clientId) !== ws) {
+                    console.log(`[MGR_QR_WS] Client Bot Instance ${clientId} connected/reconnected from ${clientIP}.`);
+                    const oldWs = clientBotWsMap.get(clientId);
+                    if (oldWs && oldWs !== ws && oldWs.readyState === WebSocket.OPEN) {
+                        console.warn(`[MGR_QR_WS] Old WebSocket for bot ${clientId} was still open. Closing it.`);
+                        oldWs.close(1001, "Replaced by new connection");
+                    }
+                    clientBotWsMap.set(clientId, ws);
+                }
+
+                if (type === botInternalReplyType) {
+                    handleClientBotInternalReply(clientId, parsedMsg);
+                } else if (botDataMessageTypes.includes(type) && onIncomingClientDataCallback) {
+                    onIncomingClientDataCallback(clientId, type, dataPayload);
+                } else {
+                    console.warn(`[MGR_QR_WS] Unhandled message type '${type}' or missing callback for bot ${clientId}.`);
+                }
+
+                ws.on('message', (subsequentMessage) => {
+                    try {
+                        const subParsedMsg = JSON.parse(subsequentMessage.toString());
+                        if (subParsedMsg.clientId === clientId) {
+                            const { type: subType, data: subDataPayload } = subParsedMsg;
+                            if (subType === botInternalReplyType) {
+                                handleClientBotInternalReply(clientId, subParsedMsg);
+                            } else if (botDataMessageTypes.includes(subType) && onIncomingClientDataCallback) {
+                                onIncomingClientDataCallback(clientId, subType, subDataPayload);
+                            } else {
+                                console.warn(`[MGR_QR_WS] Unhandled subsequent message type '${subType}' from bot ${clientId}.`);
+                            }
+                        } else {
+                            console.warn(`[MGR_QR_WS] Subsequent message clientId mismatch from ${clientIP}. Expected ${clientId}, got ${subParsedMsg.clientId}.`);
+                        }
+                    } catch (jsonErr) {
+                        console.error(`[MGR_QR_WS_ERROR] Bot subsequent message JSON parse error from ${clientIP} (BotID: ${clientId}): ${jsonErr.message}.`);
                     }
                 });
             } else {
-                console.warn(`[MGR_QR_WS] Unidentified connection from ${clientIP} after first message. Msg: ${msgStr.substring(0,100)}. Closing.`);
+                console.warn(`[MGR_QR_WS] Unidentified connection type from ${clientIP} after first message. Parsed type: '${parsedMsg.type}'. Closing.`);
                 ws.close(1008, "Unidentified client type after first message");
             }
         };
@@ -141,183 +184,223 @@ function startWebSocketServer(port, callbacks = {}) {
 
         ws.on('close', () => {
             console.log(`[MGR_QR_WS] Client disconnected from ${clientIP}.`);
-            if (ws === csharpClientWs) {
-                csharpClientWs = null;
-                console.log('[MGR_QR_WS] C# UI client disconnected. Manager QR state is now floating.');
+            // Remove from C# UI clients set if it was one
+            if (csharpUiClients.has(ws)) {
+                csharpUiClients.delete(ws);
+                // Also remove from csharpClientWsMap if present
+                for (let [csharpClientId, clientWs] of csharpClientWsMap.entries()) {
+                    if (clientWs === ws) {
+                        csharpClientWsMap.delete(csharpClientId);
+                        console.log(`[MGR_QR_WS] C# UI client '${csharpClientId}' disconnected.`);
+                        break;
+                    }
+                }
+                console.log(`[MGR_QR_WS] C# UI client disconnected. Remaining UI clients: ${csharpUiClients.size}`);
             } else {
-                for (let [clientId, clientWsInMap] of clientBotWsMap.entries()) {
+                // Check if it was a bot client
+                for (let [clientIdFromMap, clientWsInMap] of clientBotWsMap.entries()) {
                     if (clientWsInMap === ws) {
-                        clientBotWsMap.delete(clientId);
-                        console.log(`[MGR_QR_WS] Client bot ${clientId} disconnected.`);
-                        if (clientId === managerQrState.linkingClientId) {
-                             // Don't immediately update to linking_failed if bot disconnects.
-                             // The manager instance will determine the final status (e.g. if it's a graceful exit or error)
-                             // updateManagerQrState('linking_failed', 'QR linking process disconnected unexpectedly.', null, clientId, null, null, true);
-                             console.log(`[MGR_QR_WS] Linking client ${clientId} WebSocket disconnected. Manager will handle status.`);
-                        }
-                        // Notify instanceManager that the WS for this client is gone
-                        if (onIncomingClientStatusCallback) { // Use a generic status or specific 'ws_disconnected'
-                            onIncomingClientStatusCallback(clientId, { status: 'disconnected_manager_ws', message: `Client ${clientId} WS connection to manager closed.` });
+                        clientBotWsMap.delete(clientIdFromMap);
+                        console.log(`[MGR_QR_WS] Client bot ${clientIdFromMap} disconnected.`);
+                        if (onIncomingClientDataCallback) {
+                            onIncomingClientDataCallback(clientIdFromMap, 'status', { status: 'disconnected_manager_ws', message: `Client ${clientIdFromMap} WS connection to manager closed.` });
                         }
                         break;
                     }
                 }
             }
         });
-        ws.on('error', (error) => console.error('[MGR_QR_WS] WebSocket client error:', error.message));
+        
+        ws.on('error', (error) => console.error(`[MGR_QR_WS_ERROR] WebSocket client error from ${clientIP}:`, error.message));
     });
-    wss.on('error', (error) => console.error('[MGR_QR_WS] WebSocket Server Error (fatal):', error));
+    
+    wss.on('listening', () => {
+        console.log('[MGR_QR_WS] WebSocket server is listening.');
+    });
+    
+    wss.on('error', (error) => {
+        console.error(`[MGR_QR_WS_FATAL] WebSocket server error: ${error.message}`);
+        process.exit(1); // Exit if the server itself encounters a fatal error
+    });
+
+    process.on('SIGINT', stopWebSocketServer);
+    process.on('SIGTERM', stopWebSocketServer);
 }
 
-function handleCSharpUiCommand(ws, parsedMsg) {
-    const { type, clientId, apiUsername, apiPassword, ownerNumber, groupId, participantJid, ...otherData } = parsedMsg;
+function stopWebSocketServer() {
+    if (wss) {
+        console.log('[MGR_QR_WS] Stopping WebSocket server...');
+        wss.close(() => {
+            console.log('[MGR_QR_WS] WebSocket server stopped.');
+            wss = null;
+        });
+    }
+}
+
+function handleCSharpUiCommand(ws, parsedMsg) { // 'ws' here is the specific C# UI client that sent the command
+    const { type, clientId, apiUsername, apiPassword, ownerNumber, groupId, participantJid, lid, phoneJid } = parsedMsg;
+    const callCallback = (callback, ...args) => {
+        if (callback) callback(...args);
+        else console.warn(`[MGR_QR_WS] Callback not defined for C# command type: ${type}`);
+    };
 
     switch (type) {
-        case 'requestQr':
-            if (onQrRequestedCallback) onQrRequestedCallback(apiUsername, apiPassword, ownerNumber);
-            break;
-        case 'manualRelink':
-            if (onManualRelinkCallback) onManualRelinkCallback(apiUsername, apiPassword, ownerNumber);
-            break;
-        case 'listInstances':
-            if (onListInstancesCallback) onListInstancesCallback(ws);
-            break;
-        case 'startInstance':
-            if (onStartInstanceCallback && clientId) onStartInstanceCallback(clientId);
-            break;
-        case 'stopInstance':
-            if (onStopInstanceCallback && clientId) onStopInstanceCallback(clientId);
-            break;
-        case 'restartInstance':
-            if (onRestartInstanceCallback && clientId) onRestartInstanceCallback(clientId);
-            break;
-        case 'deleteInstance':
-            if (onDeleteInstanceCallback && clientId) onDeleteInstanceCallback(clientId);
-            break;
-        case 'getLogs':
-            if (onGetLogsCallback && clientId) onGetLogsCallback(ws, clientId);
-            break;
-        case 'fetchGroups':
-            if (onFetchGroupsCallback && clientId) onFetchGroupsCallback(clientId);
-            break;
+        case 'requestQr': callCallback(onQrRequestedCallback, apiUsername, apiPassword, ownerNumber); break;
+        case 'manualRelink': callCallback(onManualRelinkCallback, apiUsername, apiPassword, ownerNumber); break;
+        case 'listInstances': callCallback(onListInstancesCallback, ws); break;
+        case 'startInstance': if (clientId) callCallback(onStartInstanceCallback, clientId); break;
+        case 'stopInstance': if (clientId) callCallback(onStopInstanceCallback, clientId); break;
+        case 'restartInstance': if (clientId) callCallback(onRestartInstanceCallback, clientId); break;
+        case 'deleteInstance': if (clientId) callCallback(onDeleteInstanceCallback, clientId); break;
+        case 'getLogs': if (clientId) callCallback(onGetLogsCallback, ws, clientId); break;
+        case 'fetchGroups': if (clientId) callCallback(onFetchGroupsCallback, clientId); break;
         case 'addChatToWhitelist':
-            const jidToAdd = groupId || participantJid;
-            if (onAddChatToWhitelistCallback && clientId && jidToAdd) onAddChatToWhitelistCallback(clientId, jidToAdd);
-            break;
+            {
+                const jidToAdd = groupId || participantJid;
+                if (clientId && jidToAdd) callCallback(onAddChatToWhitelistCallback, clientId, jidToAdd);
+                break;
+            }
         case 'removeFromChatWhitelist':
-            const jidToRemove = groupId || participantJid;
-            if (onRemoveFromChatWhitelistCallback && clientId && jidToRemove) onRemoveFromChatWhitelistCallback(clientId, jidToRemove);
-            break;
+            {
+                const jidToRemove = groupId || participantJid;
+                if (clientId && jidToRemove) callCallback(onRemoveFromChatWhitelistCallback, clientId, jidToRemove);
+                break;
+            }
         case 'fetchParticipants':
-            if (onFetchParticipantsCallback && clientId && groupId) onFetchParticipantsCallback(clientId, groupId);
+            if (clientId && groupId) callCallback(onFetchParticipantsCallback, clientId, groupId);
             break;
-        default:
-            console.warn(`[MGR_QR_WS] Unhandled message type from C# UI: ${type}. Full message:`, parsedMsg);
+        case 'manualLidEntry': // Handle manualLidEntry command
+            if (clientId && lid && phoneJid) {
+                console.log(`[MGR_QR_WS] Received manualLidEntry command for client ${clientId}: LID=${lid}, phoneJid=${phoneJid}`);
+                callCallback(onManualLidEntryCallback, clientId, { lid, phoneJid });
+            } else {
+                console.warn(`[MGR_QR_WS] Invalid manualLidEntry command: missing clientId, lid, or phoneJid`);
+            }
             break;
+        case 'internalCommand': // Handle generic internalCommand from C# UI
+            if (clientId && parsedMsg.command) { // Ensure clientId and nested command are present
+                console.log(`[MGR_QR_WS] Routing internal command '${parsedMsg.command}' to client ${clientId}.`);
+                // Use the appropriate callback based on the command type
+                if (parsedMsg.command === 'manualLidEntry') {
+                    callCallback(onManualLidEntryCallback, clientId, parsedMsg);
+                } else {
+                    // For other internal commands, use a generic handler
+                    callCallback(onFetchGroupsCallback, clientId, parsedMsg);
+                }
+            } else {
+                console.warn(`[MGR_QR_WS] Invalid internalCommand received from C# UI:`, parsedMsg);
+            }
+            break;
+        default: console.warn(`[MGR_QR_WS] Unhandled message type from C# UI: ${type}. Full message:`, parsedMsg); break;
     }
 }
 
-// Renamed to be specific for internal replies from bot client
-function handleClientBotInternalReply(clientId, parsedMsg) {
-    if (parsedMsg.clientId !== clientId) {
-        console.warn(`[MGR_QR_WS] ClientId mismatch in internalReply from bot. Expected ${clientId}, got ${parsedMsg.clientId}. Ignoring.`);
+function handleClientBotInternalReply(clientId, parsedMsgFromBot) {
+    if (parsedMsgFromBot.clientId !== clientId) {
+        console.warn(`[MGR_QR_WS] ClientId mismatch in internalReply. Expected ${clientId}, got ${parsedMsgFromBot.clientId}. Ignoring.`);
         return;
     }
+    const actualPayloadForCSharp = parsedMsgFromBot.data;
+    if (actualPayloadForCSharp && actualPayloadForCSharp.type) {
+        console.log(`[MGR_QR_WS] Received internalReply from bot ${clientId}. Forwarding data (type: ${actualPayloadForCSharp.type}) to C# UIs.`);
+        // Broadcast to all connected C# UI clients
+        broadcastToCSharpUIs(actualPayloadForCSharp);
+    } else {
+        console.warn(`[MGR_QR_WS] Invalid internalReply structure from bot ${clientId}:`, parsedMsgFromBot);
+    }
+}
 
-    if (parsedMsg.type === 'internalReply') {
-        console.log(`[MGR_QR_WS] Received internal reply from bot ${clientId} for command type: ${parsedMsg.data?.type || 'unknown'}. Forwarding to C# UI.`);
-        if (csharpClientWs && csharpClientWs.readyState === WebSocket.OPEN) {
-            // Forward the 'data' part of the internalReply, which contains the actual response payload for UI
-            csharpClientWs.send(JSON.stringify(parsedMsg.data));
+// Helper function to broadcast to all connected C# UI clients
+function broadcastToCSharpUIs(data) {
+    if (csharpUiClients.size === 0 && data.type !== 'status') { // 'status' type for linking process should still attempt to broadcast
+        return;
+    }
+    const messageString = JSON.stringify(data);
+
+    csharpUiClients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            try {
+                client.send(messageString);
+            } catch (sendError) {
+                console.error(`[MGR_QR_WS_ERROR] Failed to send data to a C# UI client: ${sendError.message}. Removing client.`);
+                csharpUiClients.delete(client); // Remove problematic client
+            }
         } else {
-            console.warn(`[MGR_QR_WS] C# UI not connected, cannot forward internal reply from bot ${clientId}.`);
+            csharpUiClients.delete(client);
+        }
+    });
+}
+
+// Send a message to a specific C# client by its ID
+function sendToCsharpClient(csharpClientId, message) {
+    const ws = csharpClientWsMap.get(csharpClientId);
+    if (ws) {
+        sendToClient(ws, message);
+    } else {
+        console.warn(`[MGR_QR_WS] C# client '${csharpClientId}' not found or not connected.`);
+    }
+}
+
+// Send a message to a specific WebSocket client
+function sendToClient(ws, data) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        try {
+            ws.send(JSON.stringify(data));
+        }
+        catch (sendError) {
+            console.error(`[MGR_QR_WS_ERROR] Failed to send data to specific client: ${sendError.message}`);
         }
     } else {
-        // This function is now more specific. Other types are handled by callbacks.
-        console.warn(`[MGR_QR_WS] handleClientBotInternalReply received unexpected type: ${parsedMsg.type} from bot ${clientId}.`)
+        console.warn('[MGR_QR_WS_WARN] Cannot send message to client, WebSocket is not open or client is null.');
     }
 }
 
 function updateManagerQrState(status, message, qr = null, clientId = null, phoneNumber = null, clientName = null, isLinkingProcess = false) {
-    if (isLinkingProcess) {
-        managerQrState.linkingClientId = clientId; // Track which client is currently being linked on the UI
+    if (isLinkingProcess || status === 'qr') { // If it's part of any linking process, update the global linkingClientId
+        managerQrState.linkingClientId = clientId;
     }
-
     managerQrState.status = status;
     managerQrState.message = message;
-    managerQrState.qr = qr; // Store the latest QR in manager's state
+    managerQrState.qr = qr; // This QR is for the current linking attempt
 
     const payload = {
-        type: 'status', // All UI updates regarding linking flow through 'status' type
-        status: status, // The specific sub-status (e.g., 'qr', 'connected', 'linking_in_progress')
-        message: message,
-        qr: qr,         // The actual QR string, or null
-        clientId: (status === 'connected' || isLinkingProcess) ? clientId : null, // Relevant for linking or connected state
+        type: 'status', // This message type is understood by C# UI to update its general status/QR display
+        status,
+        message,
+        qr, // The QR string for the current linking attempt
+        clientId: (status === 'connected' || isLinkingProcess || status === 'qr') ? clientId : null, // clientID of the instance being linked or just connected
         phoneNumber: status === 'connected' ? phoneNumber : null,
-        name: status === 'connected' ? clientName : null,
+        name: status === 'connected' ? clientName : null
     };
-    
-    console.log(`[MGR_QR_WS_DEBUG] Broadcasting to C# UI: payload=`, JSON.stringify(payload).substring(0,200));
+    // Broadcast this global linking state to all C# UIs
+    broadcastToCSharpUIs(payload);
 
-
-    if (csharpClientWs && csharpClientWs.readyState === WebSocket.OPEN) {
-        try {
-            csharpClientWs.send(JSON.stringify(payload));
-        } catch (sendError) {
-            console.error(`[MGR_QR_WS_ERROR] Failed to send to C# UI: ${sendError.message}`);
-        }
-    }
-
-    // Logic for clearing linkingClientId after a terminal linking state.
-    // This should ideally be signaled by instanceManager once the permanent client is confirmed.
+    // If the linking process is definitively over (connected or failed hard), clear the linkingClientId
     if (managerQrState.linkingClientId && clientId === managerQrState.linkingClientId) {
-        if (status === 'connected') { // 'connected' is the status sent by clientBotApp upon successful WA connection
-            console.log(`[MGR_QR_WS] Client ${clientId} successfully linked and reported 'connected'. Manager may reset linking state soon.`);
-            // instanceManager will call resetManagerLinkingDisplay() after finalizing the permanent client.
-        } else if (status === 'disconnected_logout' || status === 'error_whatsapp_permanent' || status === 'linking_failed' || status === 'error_startup') {
-            console.log(`[MGR_QR_WS] Linking for ${clientId} ended with status ${status}. Resetting linkingClientId.`);
-            managerQrState.linkingClientId = null; // Reset here for immediate UI update on failure
-            // Consider if an additional specific message should be sent to UI for linking_failed reset.
+        if (status === 'connected' || status === 'disconnected_logout' || status === 'error_whatsapp_permanent' || status === 'linking_failed' || status === 'error_startup' || status.startsWith('exited')) {
+            if (status !== 'connected') { // Keep linkingClientId if connected, for the UI that initiated it to claim.
+                // managerQrState.linkingClientId = null; // Let manager.js handle clearing this based on specific UI flows
+            }
         }
     }
 }
 
 function notifyInstanceStatusChange(clientId, status, phoneNumber = null, name = null) {
-    const payload = {
-        type: 'instanceStatusUpdate',
-        clientId: clientId,
-        status: status,
-        phoneNumber: phoneNumber,
-        name: name,
-        timestamp: new Date().toISOString()
-    };
-    if (csharpClientWs && csharpClientWs.readyState === WebSocket.OPEN) {
-        try {
-            csharpClientWs.send(JSON.stringify(payload));
-        } catch (sendError) {
-             console.error(`[MGR_QR_WS_ERROR] Failed to send instanceStatusUpdate to C# UI: ${sendError.message}`);
-        }
-    }
+    const payload = { type: 'instanceStatusUpdate', clientId, status, phoneNumber, name, timestamp: new Date().toISOString() };
+    // Broadcast to all C# UIs
+    broadcastToCSharpUIs(payload);
 }
 
-function sendToClient(ws, data) {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        try {
-            ws.send(JSON.stringify(data));
-        } catch (sendError) {
-            console.error(`[MGR_QR_WS_ERROR] Failed to send data to specific client: ${sendError.message}`);
-        }
-    } else {
-        console.warn('[MGR_QR_WS] Cannot send message to client, WebSocket is not open.');
-    }
+function notifyParticipantDetailsUpdate(forClientId, originalLid, resolvedPhoneJid, displayName) {
+    const payload = { type: 'participantDetailsUpdate', clientId: forClientId, originalLid, resolvedPhoneJid, displayName };
+    // Broadcast to all C# UIs
+    broadcastToCSharpUIs(payload);
 }
 
 function resetManagerLinkingDisplay() {
-    console.log(`[MGR_QR_WS] Resetting manager linking display. Current linkingClientId: ${managerQrState.linkingClientId}`);
     const oldLinkingId = managerQrState.linkingClientId;
-    managerQrState.linkingClientId = null;
-    // Send a clear state to UI, indicating no active linking process.
-    // The 'status' being 'disconnected' here means the "linking process" is disconnected/reset.
+    managerQrState.linkingClientId = null; // Clear who was being linked globally
+    // Broadcast the new "disconnected" linking state
     updateManagerQrState('disconnected', 'Waiting for new linking attempt...', null, oldLinkingId, null, null, false);
 }
 
@@ -325,8 +408,11 @@ module.exports = {
     startWebSocketServer,
     updateManagerQrState,
     resetManagerLinkingDisplay,
-    managerQrState, // Export for instanceManager to check linkingClientId
+    managerQrState,
     notifyInstanceStatusChange,
+    notifyParticipantDetailsUpdate,
     sendToClient,
-    clientBotWsMap
+    sendToCsharpClient,
+    broadcastToCSharpUIs,
+    clientBotWsMap // Keep this for instanceManager to interact with bot instances
 };

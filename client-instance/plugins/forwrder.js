@@ -1,16 +1,23 @@
 // client-instance/plugins/forwrder.js
-// Extracts message information and sends it to an external API
-
 const fetch = require('node-fetch');
 const { v4: uuidv4 } = require('uuid');
-const { isWhitelisted } = require('./whitelist');
-const { getApiToken, stripCountryCode } = require('../lib/apiSync');
+// const { isWhitelisted } = require('./whitelist'); // <-- REMOVED THIS LINE
+const { getApiToken } = require('../lib/apiSync');
 const config = require('../../config');
-
+let process = require('process');
 const API_BASE_URL = process.env.API_BASE_URL;
 const RAW_NOTIFICATION_API_PATH = '/raw-notifications';
 const RAW_NOTIFICATION_API_ENDPOINT = `${API_BASE_URL}${RAW_NOTIFICATION_API_PATH}`;
 
+// Add this function in forwarder.js
+function stripCountryCode(fullNumber, countryCode = '967') {
+    if (!fullNumber) return '';
+    const numberPart = fullNumber.toString().replace(/[^0-9]/g, '');
+    if (numberPart.startsWith(countryCode)) {
+        return numberPart.substring(countryCode.length);
+    }
+    return numberPart;
+}
 function generateSourcePackageName() {
     const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
     let result = '';
@@ -21,111 +28,68 @@ function generateSourcePackageName() {
 }
 
 module.exports = {
-    all: async function (m, { sock, chatId, sender, isGroup, groupMetadata, isOwner /* Ensure isOwner is passed from handler */ }) {
-        console.log(`[FORWARDER-API] Initiating forwarding checks for message from ${sender.split('@')[0]} in ${isGroup ? 'group ' + chatId.split('@')[0] : 'DM'}. IsOwner: ${isOwner}.`);
-
-        // --- NEW: Owner bypass for forwarding ---
-        if (isOwner) {
-            console.log(`[FORWARDER-API] Owner message from ${sender}. Bypassing all whitelist/group rules for forwarding.`);
-        } else {
-            // Original whitelist checks for non-owners
-            // 1. Check if the GROUP CHAT itself is whitelisted (if message is from a group)
-            if (isGroup) {
-                const isGroupWhitelisted = isWhitelisted(chatId);
-                if (!isGroupWhitelisted) {
-                    console.log(`[FORWARDER-API] Skipping forwarding: Group ${chatId} not whitelisted.`);
-                    return; // Block message
-                }
-                console.log(`[FORWARDER-API] Group ${chatId} is whitelisted.`);
-            }
-
-            // 2. Check if the SENDER is generally whitelisted
-            const isSenderGenerallyWhitelisted = isWhitelisted(sender);
-            if (!isSenderGenerallyWhitelisted) {
-                console.log(`[FORWARDER-API] Skipping forwarding: Sender ${sender} not generally whitelisted.`);
-                return; // Block message
-            }
-            console.log(`[FORWARDER-API] Sender ${sender} is generally whitelisted.`);
-
-            // 3. Check if the SENDER is specifically allowed to have messages processed IN GROUPS
-            if (isGroup) {
-                const senderAllowedInGroups = global.userGroupPermissions && global.userGroupPermissions[sender] && global.userGroupPermissions[sender].allowed_in_groups === true;
-                if (!senderAllowedInGroups) {
-                    console.log(`[FORWARDER-API] Skipping forwarding: Sender ${sender} not allowed to send messages in groups.`);
-                    return; // Block message
-                }
-                console.log(`[FORWARDER-API] Sender ${sender} is allowed in groups.`);
-            }
+    // UPDATED: 'sock' parameter removed from the function signature
+    all: async function (m, { chatId, sender, isGroup, groupMetadata, isOwner, pushName }) {
+        if (typeof sender !== 'string' || !sender.includes('@')) {
+            console.warn(`[${process.env.CLIENT_ID}_FORWARDER-API] Skipping forwarder because sender is not a valid JID string. Sender:`, sender);
+            return m;
         }
 
-        // If isOwner was true, we skip the above block and directly proceed here.
-        // If isOwner was false, the above block's checks must have passed to reach here.
+        console.log(`[${process.env.CLIENT_ID}_FORWARDER-API] Initiating forwarding for message from ${sender.split('@')[0]} (Name: ${pushName}) in ${isGroup ? 'group ' + (groupMetadata?.subject || chatId.split('@')[0]) : 'DM'}. IsOwner: ${isOwner}.`);
 
-        console.log(`[FORWARDER-API] All necessary checks passed. Proceeding to forward message.`);
-
+        // The primary whitelist filter is applied in _whitelistFilter.js, so no check is needed here.
 
         try {
             const msgType = Object.keys(m.message)[0];
             if (!m.message[msgType]) {
-                console.warn(`[FORWARDER-API] Invalid message structure or unknown msgType: ${msgType}. Skipping.`);
+                console.warn(`[${process.env.CLIENT_ID}_FORWARDER-API] Invalid message structure or unknown msgType: ${msgType}. Skipping.`);
                 return;
             }
 
             let originalContent = "";
             if (m.message.conversation) {
                 originalContent = m.message.conversation;
-                console.log(`[FORWARDER-API] Extracted conversation content.`);
             } else if (m.message.extendedTextMessage) {
                 originalContent = m.message.extendedTextMessage.text;
-                console.log(`[FORWARDER-API] Extracted extendedTextMessage content.`);
             } else if (m.message.imageMessage && m.message.imageMessage.caption) {
                 originalContent = m.message.imageMessage.caption;
-                console.log(`[FORWARDER-API] Extracted imageMessage caption.`);
             } else if (m.message.videoMessage && m.message.videoMessage.caption) {
                 originalContent = m.message.videoMessage.caption;
-                console.log(`[FORWARDER-API] Extracted videoMessage caption.`);
             } else if (m.message.documentMessage && m.message.documentMessage.caption) {
                 originalContent = m.message.documentMessage.caption;
-                console.log(`[FORWARDER-API] Extracted documentMessage caption.`);
             } else if (msgType === 'listResponseMessage') {
                 originalContent = `Selected List Item: "${m.message.listResponseMessage.title}" (ID: ${m.message.listResponseMessage.singleSelectReply?.selectedRowId || 'N/A'})`;
-                console.log(`[FORWARDER-API] Extracted listResponseMessage content.`);
             } else if (msgType === 'buttonsResponseMessage') {
                 originalContent = `Clicked Button: "${m.message.buttonsResponseMessage.selectedDisplayText || m.message.buttonsResponseMessage.selectedButtonId || 'N/A'}"`;
-                console.log(`[FORWARDER-API] Extracted buttonsResponseMessage content.`);
             } else if (msgType === 'templateButtonReplyMessage') {
                 originalContent = `Clicked Template Button: "${m.message.templateButtonReplyMessage.selectedDisplayText || m.message.templateButtonReplyMessage.selectedId || 'N/A'}"`;
-                console.log(`[FORWARDER-API] Extracted templateButtonReplyMessage content.`);
             } else if (m.message.imageMessage || m.message.videoMessage || m.message.audioMessage || m.message.stickerMessage || m.message.documentMessage) {
-                originalContent = `[${msgType.replace('Message', '').toUpperCase()} MESSAGE]`; // Placeholder for media without text
-                console.log(`[FORWARDER-API] Extracted media message without caption: ${msgType}`);
+                originalContent = `[${msgType.replace('Message', '').toUpperCase()} MESSAGE - Sender: ${pushName}]`;
             } else {
-                console.log(`[FORWARDER-API] No specific content extraction for msgType: ${msgType}. Content will be empty.`);
+                console.log(`[${process.env.CLIENT_ID}_FORWARDER-API] No specific content extraction for msgType: ${msgType}. Content will be empty.`);
             }
 
-
             const fullSenderPhoneNumber = sender.split('@')[0];
-            const senderPhoneNumber = stripCountryCode(fullSenderPhoneNumber, config.DEFAULT_PHONE_COUNTRY_CODE); // Using config.DEFAULT_PHONE_COUNTRY_CODE
-
-            console.log(`[FORWARDER-API] Original sender number: ${fullSenderPhoneNumber}, Stripped: ${senderPhoneNumber}`); // Added log
+            const senderPhoneNumberForApi = sender.endsWith('@s.whatsapp.net')
+                ? stripCountryCode(fullSenderPhoneNumber, config.DEFAULT_PHONE_COUNTRY_CODE)
+                : fullSenderPhoneNumber;
 
             const payload = {
                 original_content: originalContent,
-                sender_phone_number_from_device_contacts: senderPhoneNumber,
-                sender_display_name_from_notification: senderPhoneNumber,
+                sender_phone_number_from_device_contacts: senderPhoneNumberForApi,
+                sender_display_name_from_notification: pushName,
                 source_package_name: generateSourcePackageName(),
                 client_event_key: uuidv4(),
                 event_timestamp_utc: new Date(m.messageTimestamp * 1000).toISOString(),
             };
 
-            console.log('[FORWARDER-API] Final Payload to send (truncated for log):', JSON.stringify(payload, null, 2).substring(0, 500) + '...'); // Log truncated payload
+            console.log(`[${process.env.CLIENT_ID}_FORWARDER-API] Final Payload to send (truncated for log):`, JSON.stringify(payload).substring(0, 500) + '...');
 
             const apiToken = getApiToken();
             if (!apiToken) {
-                console.error('[FORWARDER-API] No API token available for forwarding. Cannot send raw notification.');
+                console.error(`[${process.env.CLIENT_ID}_FORWARDER-API] No API token available. Cannot send raw notification.`);
                 return;
             }
-            console.log(`[FORWARDER-API] API token available (length: ${apiToken.length}). Sending to ${RAW_NOTIFICATION_API_ENDPOINT}.`); // Added log
 
             const response = await fetch(RAW_NOTIFICATION_API_ENDPOINT, {
                 method: 'POST',
@@ -135,27 +99,18 @@ module.exports = {
                 },
                 body: JSON.stringify(payload),
             });
-
-            console.log(`[FORWARDER-API] Raw notification API response status: ${response.status}`); // Added log
-
             if (response.ok) {
-                try {
-                    const responseData = await response.json();
-                    console.log(`[FORWARDER-API] Successfully sent raw notification. API Response (truncated):`, JSON.stringify(responseData).substring(0, 200) + '...');
-                } catch (jsonError) {
-                    const rawResponseText = await response.text();
-                    console.log(`[FORWARDER-API] Successfully sent raw notification. Response was not JSON or empty. Status: ${response.status}. Raw response: ${rawResponseText.substring(0, 100)}...`); // Log raw response if not JSON
-                }
+                const responseData = await response.json();
+                console.log(`[${process.env.CLIENT_ID}_FORWARDER-API] Successfully sent raw notification. Response:${response.status}`, responseData);
             } else {
                 const errorText = await response.text();
-                console.error(`[FORWARDER-API] Failed to send raw notification. Status: ${response.status}. Response: ${errorText}`);
-                if (response.status === 401 || response.status === 403) {
-                    console.warn('[FORWARDER-API] Token might be invalid for raw_notification endpoint. Consider re-login or token refresh logic.');
-                }
+                console.error(`[${process.env.CLIENT_ID}_FORWARDER-API] Failed to send raw notification. Status: ${response.status}. Response: ${errorText}`);
             }
 
         } catch (error) {
-            console.error('[FORWARDER-API] Critical Error processing message for API:', error.message, error.stack); // Log stack trace
+            console.error(`[${process.env.CLIENT_ID}_FORWARDER-API] Critical Error processing message for API:`, error.message, error.stack);
         }
+        
+        return m;
     }
 };
