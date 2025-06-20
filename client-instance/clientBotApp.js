@@ -40,7 +40,8 @@ if (!global.pushNameCache) { // كاش لتخزين pushName مؤقتًا
     global.pushNameCache = new Map();
 }
 
-const botContactsDb = require('../database/botContactsDb'); // Import the new module
+// const botContactsDb = require('../database/botContactsDb'); // Import the new module
+const { findBestDisplayName } = require('./lib/contactUtils'); // Import the utility function
 let clientConfig = {};
 const clientConfigPath = path.join(path.dirname(AUTH_DIR), 'client_config.json');
 if (fs.existsSync(clientConfigPath)) {
@@ -62,66 +63,64 @@ const config = require('../config');
 let managerWsClient = null;
 let reconnectManagerWsInterval = null;
 let sock = null;
-// Function to fetch and save contacts (ADD THIS NEW FUNCTION)
 async function fetchAndSaveContacts() {
-    console.log(`[${CLIENT_ID}] Fetching and saving contacts...`);
-    const botInstanceId = await botContactsDb.getClientBotInstanceId(); // Use the local method to get instance ID
+    console.log(`[${CLIENT_ID}] Starting manual contact sync...`);
     if (!botInstanceId) {
-        console.error(`[${CLIENT_ID}_CONTACTS_SYNC_ERROR] Could not get bot instance ID for contact sync.`);
+        console.error(`[${CLIENT_ID}_CONTACTS_SYNC_ERROR] Bot Instance ID not available. Aborting sync.`);
         return;
     }
 
     try {
-        // Correctly access contacts. It is typically a Map.
-        // Using `sock.contacts` directly may not contain all contacts.
-        // A more robust way is to listen to 'contacts.update' or use an IQ query.
-        // For initial sync, `sock.store.contacts.all()` might be more reliable
-        // if you are using a store that caches contacts.
-        // However, based on how `sock.contacts` is usually used, it refers to a Map-like structure.
+        const contactsMap = sock.contacts || {};
+        const allSyncedUserJids = [];
 
-        // Let's assume `sock.contacts` will be a Map once populated.
-        // If it's not yet populated, it might be undefined/null, or an empty Map.
-        const contactsMap = sock.contacts || new Map(); // Initialize as empty Map if null/undefined
+        console.log(`[${CLIENT_ID}_CONTACTS_SYNC] Processing ${Object.keys(contactsMap).length} contacts from address book.`);
 
-        const jidsToKeep = [];
-
-        // Correct way to iterate over a Map
-        console.log(`[${CLIENT_ID}_CONTACTS_SYNC] Processing ${contactsMap.size} contacts.`);
-
-        for (const [jid, contact] of contactsMap.entries()) { // Iterate Map directly
-            // Ensure the JID is valid and a primary JID type if needed, e.g. 's.whatsapp.net'
+        for (const jid in contactsMap) {
+            const contact = contactsMap[jid];
+            
             if (!jid || !jid.includes('@') || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) {
-                continue; // Skip group JIDs or invalid JIDs in contact list for bot_contacts
+                continue; // Skip invalid or group JIDs
             }
 
-            const name = contact.name || contact.notify || contact.verifiedName || contact.vname || contact.short || contact.pushName || jid.split('@')[0];
-            const phoneNumber = jid.includes('@s.whatsapp.net') ? jid.split('@')[0] : (contact.number || null);
+            // Use our new utility to find the best possible name for the contact.
+            const displayName = findBestDisplayName({ baileysContact: contact });
 
-            jidsToKeep.push(jid);
+            // Only process contacts that have a valid, non-generic name.
+            if (displayName) {
+                const userJid = jid.endsWith('@s.whatsapp.net') ? jid : null;
+                const lidJid = jid.endsWith('@lid') ? jid : null;
 
-            await botContactsDb.upsertBotContact(
-                botInstanceId,
-                jid, // This is the contact's JID
-                phoneNumber, // This is the raw phone number (without @s.whatsapp.net)
-                name,
-                contact.pushName // pushName can be stored as whatsapp_name
-            );
+                // For the manual sync, we ONLY care about contacts that have a real phone number JID.
+                // This is because the sync is for the "address book", which contains phone numbers.
+                if (userJid) {
+                    allSyncedUserJids.push(userJid);
+
+                    const contactData = {
+                        userJid: userJid,
+                        // If the contact object also has a lid, we can add it for merging.
+                        lidJid: contact.lid || lidJid,
+                        phoneNumber: userJid.split('@')[0],
+                        displayName: displayName,
+                        whatsappName: contact.notify || contact.pushName || null,
+                        isWhatsappContact: true,
+                        isSavedContact: true // <<< CRITICAL: These are "saved" contacts.
+                    };
+
+                    await upsertBotContact(botInstanceId, contactData);
+                }
+            }
         }
 
-        await botContactsDb.deleteStaleContactsForInstance(botInstanceId, jidsToKeep);
+        // Mark any saved contacts that were not in this sync as inactive.
+        console.log(`[${CLIENT_ID}_CONTACTS_SYNC] Finished upserting contacts. Now checking for stale contacts...`);
+        await require('../database/botContactsDb').deleteStaleContactsForInstance(botInstanceId, allSyncedUserJids);
 
-        console.log(`[${CLIENT_ID}_CONTACTS_SYNC] Contacts sync completed. Kept ${jidsToKeep.length} contacts.`);
-
+        console.log(`[${CLIENT_ID}_CONTACTS_SYNC] Manual contact sync completed.`);
     } catch (error) {
-        console.error(`[${CLIENT_ID}_CONTACTS_SYNC_ERROR] Error fetching or saving contacts: ${error.message}`, error.stack);
-        // Added explicit TypeError check, as the `contacts = await sock.contacts` line can throw an error
-        // if `sock` itself is undefined/null before `connection.update` 'open'
-        if (error instanceof TypeError && error.message.includes('Cannot convert undefined or null to object')) {
-            console.error(`[${CLIENT_ID}_CONTACTS_SYNC_ERROR] Likely, sock.contacts was not ready. Ensure this runs AFTER WhatsApp connection is 'open'.`);
-        }
+        console.error(`[${CLIENT_ID}_CONTACTS_SYNC_ERROR] An error occurred during contact sync: ${error.message}`, error.stack);
     }
 }
-
 
 
 function connectToManagerWebSocket() {
@@ -323,31 +322,14 @@ async function startClientBot() {
 
     sock.ev.on('messages.upsert', async (upsert) => {
         if (upsert.type !== 'notify') return;
-
-        for (const m of upsert.messages) {
-            const senderJid = jidNormalizedUser(m.key.participant || m.key.remoteJid);
-            const pushName = m.pushName;
-
-            // Update the temporary cache for immediate use
-            if (senderJid && pushName && pushName !== "UnknownPN") {
-                global.pushNameCache.set(senderJid, pushName);
-            }
-
-            // client-instance/clientBotApp.js -> inside 'messages.upsert' handler
-
-            // **Persist the learned name to the database**
-            if (botInstanceId && senderJid && pushName && pushName !== "UnknownPN") {
-                // This is a "fire-and-forget" call for performance.
-                upsertBotContact(
-                    botInstanceId,
-                    senderJid,
-                    pushName,      // displayName
-                    pushName       // whatsappName
-                ).catch(e => console.error(`[${CLIENT_ID}] Background contact upsert failed for ${senderJid}: ${e.message}`));
-            }
-
-            if (!m.key.fromMe) {
-                await handleMessage(sock, m, { clientId: CLIENT_ID });
+    
+        for (const msg of upsert.messages) {
+            // We no longer need any contact creation logic here.
+            // The _whitelistFilter handles it perfectly.
+    
+            // All we need to do is pass the message to the main handler if it's not from us.
+            if (!msg.key.fromMe) {
+                await handleMessage(sock, msg, { clientId: CLIENT_ID });
             }
         }
     });
@@ -363,6 +345,19 @@ async function startClientBot() {
             await fetchAndSaveContacts();
             initialContactsSet = true;
         }
+        /* try {
+            const botInstanceIdForContact = await botContactsDb.getClientBotInstanceId();
+            if (botInstanceIdForContact && !m.key.fromMe) {
+                const isGroup = (m.key.remoteJid || '').endsWith('@g.us');
+                await botContactsDb.handleMessageContactAutoAdd(
+                    botInstanceIdForContact,
+                    m,
+                    isGroup
+                );
+            }
+        } catch (contactError) {
+            console.error(`[HANDLER_ERROR] Failed during contact auto-add: ${contactError.message}`, contactError.stack);
+        } */
         // If you want to continuously update on every contact change, you'd call fetchAndSaveContacts() here
         // or process 'contacts.update' which streams individual changes.
         // For now, this `contacts.set` listener for the initial big sync is good.

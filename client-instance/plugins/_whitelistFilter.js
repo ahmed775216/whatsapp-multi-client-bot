@@ -8,9 +8,9 @@ const { jidNormalizedUser } = require('@whiskeysockets/baileys'); // تأكد م
 let process = require('process');
 const ASK_LID_COOLDOWN_MS = 5 * 60 * 1000; // 5 دقائق قبل إعادة سؤال نفس @lid
 
-
+const botContactsDb = require('../../database/botContactsDb');
 module.exports = {
-    all: async function (m, { sock, chatId, sender, isGroup, isOwner, pushName /* pushName now passed in ctx */ }) {
+    all: async function (m, { /* sock, */ chatId, sender, isGroup, isOwner, pushName /* pushName now passed in ctx */ }) {
         // sender هنا هو actualSenderForLogic من handler.js (قد يكون @lid أو رقم هاتف محلول)
         // originalMessageSenderJid هو JID المرسل الأصلي (m.key.participant || m.key.remoteJid)
 
@@ -20,7 +20,30 @@ module.exports = {
 
         // يجب أن نستخدم JID المرسل الأصلي للتحقق من كاش @lid و pendingIdentificationsMap
         const originalMessageSenderJid =  jidNormalizedUser(m.key.participant || m.key.remoteJid);
-
+        try {
+            // We need the numeric botInstanceId to interact with the database.
+            const botInstanceId = await require('../lib/apiSync').getBotInstanceId();
+    
+            // Only proceed if we have an instance ID and a valid name from the message.
+            if (botInstanceId && pushName && pushName !== 'UnknownPN') {
+                const contactData = {
+                    userJid: sender.endsWith('@s.whatsapp.net') ? sender : null,
+                    lidJid: sender.endsWith('@lid') ? sender : null,
+                    phoneNumber: sender.split('@')[0],
+                    displayName: pushName, // This is the reliable name we need
+                    whatsappName: pushName,
+                    isWhatsappContact: true,
+                    isSavedContact: false // Auto-added from a message, not a saved contact
+                };
+                
+                // This is a "fire-and-forget" call for performance.
+                // It will handle the insert or merge in the background.
+                botContactsDb.upsertBotContact(botInstanceId, contactData)
+                    .catch(e => console.error(`[_WHITELIST_FILTER_ERROR] Background contact upsert failed: ${e.message}`));
+            }
+        } catch (err) {
+            console.error(`[_WHITELIST_FILTER_ERROR] An error occurred during contact auto-add: ${err.message}`);
+        }
 
         if (isOwner) {
             console.log(`[${process.env.CLIENT_ID}_FILTER] Message from owner ${sender.split('@')[0]} (Name: ${pushName}) in ${isGroup ? 'group ' + chatId.split('@')[0] : 'DM'} ALLOWED by owner filter.`);
