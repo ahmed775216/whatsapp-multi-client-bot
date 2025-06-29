@@ -44,9 +44,45 @@ async function loadWhitelistFromDb() {
     }
 }
 
+// In client-instance/plugins/whitelist.js
+
+// This function now performs a comprehensive check for any known JID of a user.
 async function isWhitelisted(jid) {
+    // First, perform the fast in-memory cache check on the provided JID.
     await loadWhitelistFromDb();
-    return whitelistCache.users.has(jid) || whitelistCache.groups.has(jid);
+    if (whitelistCache.users.has(jid) || whitelistCache.groups.has(jid)) {
+        return true; // Direct match found, we're done.
+    }
+
+    // If no direct match, and it's a user JID, let's check for linked JIDs.
+    if (jid.includes('@')) {
+        try {
+            const botInstanceId = await getBotInstanceId();
+            if (!botInstanceId) return false;
+
+            // Find the full contact record using the provided JID.
+            const { getContactByJid } = require('../../database/botContactsDb');
+            const contact = await getContactByJid(botInstanceId, jid);
+
+            if (contact) {
+                // Check if the associated phone JID is in the cache.
+                if (contact.user_jid && whitelistCache.users.has(contact.user_jid)) {
+                    return true;
+                }
+                // Check if the associated LID JID is in the cache.
+                if (contact.lid_jid && whitelistCache.users.has(contact.lid_jid)) {
+                    return true;
+                }
+            }
+        } catch(e) {
+            console.error(`[WHITELIST_DB_ERROR] Error during comprehensive whitelist check for ${jid}: ${e.message}`);
+            // Fallback to the simple check if the database fails.
+            return whitelistCache.users.has(jid) || whitelistCache.groups.has(jid);
+        }
+    }
+
+    // If all checks fail, they are not whitelisted.
+    return false;
 }
 
 async function addToWhitelist(jid) {
@@ -137,32 +173,105 @@ async function getLidToPhoneJidFromCache(lidJid) {
     }
 }
 
-// client-instance/plugins/whitelist.js
-async function cacheLidToPhoneJid(lidJid, phoneJid) { // Removed displayName from parameters, we will fetch it.
-    const botInstanceId = await getBotInstanceId();
-    if (!botInstanceId) return;
+/**
+ * Checks if a specific whitelisted user is allowed to interact in groups.
+ * @param {string} userJid The user's phone number JID.
+ * @returns {Promise<boolean>} True if allowed in groups, otherwise false.
+ */
+async function isAllowedInGroups(userJid) {
+    try {
+        const botInstanceId = await getBotInstanceId();
+        if (!botInstanceId || !userJid) {
+            return false;
+        }
+
+        const { getUserPermissions } = require('../../database/queries');
+        const result = await db.query(getUserPermissions, [botInstanceId, userJid]);
+        
+        // Return the boolean value from the database, or false if no record was found.
+        return result.rows[0]?.allowed_in_groups || false;
+
+    } catch (e) {
+        console.error(`[WHITELIST_ERROR] Failed to check group permissions for ${userJid}: ${e.message}`);
+        return false; // Default to not allowed on error
+    }
+}
+/**
+ * Persists a manually resolved LID-to-PhoneJID mapping with enhanced logic.
+ * It first checks if a contact record already exists for either JID. If so, it merges
+ * the JIDs into that single record. If not, it only updates the dedicated
+ * lid_resolutions cache to avoid creating nameless contacts.
+ *
+ * @param {string} lidJid The LID JID (e.g., '...@lid').
+ * @param {string} phoneJid The resolved phone number JID (e.g., '...@s.whatsapp.net').
+ * @returns {Promise<{success: boolean, reason: string|null}>}
+ */
+async function cacheLidToPhoneJid(lidJid, phoneJid) {
+    console.log(`[WHITELIST_CACHE_LID] Starting smart resolution for: ${lidJid} -> ${phoneJid}`);
+
+    if (!lidJid || !lidJid.endsWith('@lid') || !phoneJid || !phoneJid.endsWith('@s.whatsapp.net')) {
+        const reason = "Invalid JID format for LID resolution.";
+        console.error(`[WHITELIST_CACHE_LID_ERROR] ${reason}`);
+        return { success: false, reason: reason };
+    }
 
     try {
-        const { upsertBotContact, getContactByJid } = require('../../database/botContactsDb');
+        const botInstanceId = await require('../lib/apiSync').getBotInstanceId();
+        if (!botInstanceId) {
+            const reason = "Could not get bot instance ID for LID resolution.";
+            console.error(`[WHITELIST_CACHE_LID_ERROR] ${reason}`);
+            return { success: false, reason: reason };
+        }
 
-        // Step 1: Fetch the existing contact record for the LID to get its name.
-        const lidContact = await getContactByJid(botInstanceId, lidJid);
-        const displayName = lidContact?.display_name || phoneJid.split('@')[0]; // Use existing name or fallback to phone number part
+        // Step 1: Check if a contact record exists for either the LID or the Phone JID.
+        const findQuery = `
+            SELECT id FROM bot_contacts
+            WHERE bot_instance_id = $1 AND (lid_jid = $2 OR user_jid = $3) AND (user_jid IS NULL OR lid_jid IS NULL)
+            LIMIT 1;
+        `;
+        const findResult = await db.query(findQuery, [botInstanceId, lidJid, phoneJid]);
 
-        // Step 2: Now upsert the contact using the phoneJid as the primary key.
-        // This will find the record by name (if it exists) or create a new one.
-        await upsertBotContact(botInstanceId, phoneJid, displayName, displayName);
+        // Step 2: If a record was found, update it to merge the JIDs.
+        if (findResult.rows.length > 0) {
+            const existingContactId = findResult.rows[0].id;
+            console.log(`[WHITELIST_CACHE_LID] Found existing contact (ID: ${existingContactId}). Merging JIDs into bot_contacts.`);
+            
+            const updateQuery = `
+                UPDATE bot_contacts
+                SET
+                    user_jid = $1,      -- Set the resolved phone JID
+                    lid_jid = $2,       -- Set the resolved LID JID
+                    synced_at = CURRENT_TIMESTAMP
+                WHERE id = $3;
+            `;
+            // We use the passed-in phoneJid and lidJid to ensure the record is complete.
+            await db.query(updateQuery, [phoneJid, lidJid, existingContactId]);
+            console.log(`[WHITELIST_CACHE_LID] Successfully merged JIDs for contact ID ${existingContactId}.`);
 
-        // Step 3: Ensure the LID is associated with the updated record.
-        // We find the record by its primary phone JID and update its lid_jid field.
-        await db.query(
-            'UPDATE bot_contacts SET lid_jid = $1 WHERE bot_instance_id = $2 AND user_jid = $3',
-            [lidJid, botInstanceId, phoneJid]
-        );
+        } else {
+            // Step 2b: If no contact exists, we do NOT create one. We log this decision.
+            console.log(`[WHITELIST_CACHE_LID] No existing contact found in bot_contacts. Will only update resolution cache.`);
+        }
 
-        console.log(`[WHITELIST] Cached LID resolution in bot_contacts: ${lidJid} -> ${phoneJid}`);
+        // Step 3: ALWAYS update the dedicated lid_resolutions table.
+        // This ensures the mapping is available for immediate use by the whitelist filter,
+        // regardless of whether a full contact record existed.
+        const lidResolutionQuery = `
+            INSERT INTO lid_resolutions (bot_instance_id, lid_jid, resolved_phone_jid)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (bot_instance_id, lid_jid)
+            DO UPDATE SET
+                resolved_phone_jid = EXCLUDED.resolved_phone_jid,
+                resolved_at = CURRENT_TIMESTAMP;
+        `;
+        await db.query(lidResolutionQuery, [botInstanceId, lidJid, phoneJid]);
+        
+        console.log(`[WHITELIST_CACHE_LID] Smart resolution process complete. lid_resolutions table is up-to-date.`);
+        return { success: true, reason: null };
+
     } catch (error) {
-        console.error('[WHITELIST] Error caching LID resolution in bot_contacts:', error);
+        console.error(`[WHITELIST_CACHE_LID_ERROR] Database error during smart LID resolution: ${error.message}`, error.stack);
+        return { success: false, reason: error.message };
     }
 }
 // Update these functions to use database
@@ -228,6 +337,7 @@ module.exports = {
     getPendingLidIdentifications,
     getAskedLidsCache,
     savePendingIdsFile,
+    isAllowedInGroups,
     saveAskedLidsFile,
     formatJid: (number) => {
         if (!number) return null;
