@@ -16,8 +16,6 @@ async function handleMessage(sock, m, options = {}) {
     const isInternalCommand = options.isInternalCommand || false;
     const internalReply = options.internalReply || null;
     const clientIdForReply = options.clientId || process.env.CLIENT_ID; // تأكد من وجود clientIdForReply
-
-    // ... (كود الأوامر الداخلية كما هو) ...
     if (isInternalCommand) {
         console.log(`[${clientIdForReply}_HANDLER_INTERNAL] Received internal command: ${options.command} with payload:`, { groupId: options.groupId, participantJid: options.participantJid });
         try {
@@ -32,7 +30,7 @@ async function handleMessage(sock, m, options = {}) {
                                     id: g.id,
                                     subject: g.subject,
                                     participantsCount: g.participants.length,
-                                    isWhitelisted: await isWhitelisted(g.id) // <-- note the 'await' here
+                                    isWhitelisted: await isWhitelisted(g.id)
                                 };
                             })
                         );
@@ -272,7 +270,24 @@ async function handleMessage(sock, m, options = {}) {
                         }
 
                         try {
-                            await cacheLidToPhoneJid(lid, phoneJid);
+                            // --- NEW NAMING LOGIC ---
+                            // 1. Check if we already know a name for this LID from the live cache.
+                            let nameToUse = global.pushNameCache?.get(lid);
+
+                            // 2. If not, use the phone number as a temporary name.
+                            if (!nameToUse) {
+                                nameToUse = phoneJid.split('@')[0];
+                                console.log(`[${clientIdForReply}_HANDLER_INTERNAL] No pushName found for ${lid}. Using phone number '${nameToUse}' as temporary name.`);
+                            }
+
+                            // 3. Update the database. Our smart `cacheLidToPhoneJid` will handle the merge.
+                            await cacheLidToPhoneJid(lid, phoneJid, nameToUse);
+
+                            // 4. Update the live cache for both JIDs with the best name we have.
+                            // This ensures subsequent lookups in this session are fast and correct.
+                            global.pushNameCache?.set(lid, nameToUse);
+                            global.pushNameCache?.set(phoneJid, nameToUse);
+
                             if (internalReply) internalReply({
                                 type: 'manualLidEntryResponse',
                                 success: true,
@@ -280,7 +295,26 @@ async function handleMessage(sock, m, options = {}) {
                                 phoneJid: phoneJid,
                                 message: `LID ${lid} manually entered and cached to ${phoneJid}.`,
                                 clientId: clientIdForReply
+                                
                             });
+                        
+                            
+                            // --- ADD THIS ---
+                            // After a successful manual resolution, we should notify the UI to refresh
+                            // the participant list to show the newly resolved phone number.
+                            // We use the 'participantDetailsUpdate' message which the UI already understands.
+                            if (internalReply) {
+                                const updatePayload = {
+                                    type: 'participantDetailsUpdate',
+                                    clientId: clientIdForReply,
+                                    originalLid: lid,
+                                    resolvedPhoneJid: phoneJid,
+                                    displayName: nameToUse
+                                };
+                                internalReply(updatePayload);
+                                console.log(`[${clientIdForReply}_HANDLER_INTERNAL] Sent participantDetailsUpdate to UI for ${lid}.`);
+                            }
+
                             console.log(`[${clientIdForReply}_HANDLER_INTERNAL] Manual LID entry successful for ${lid}.`);
                         } catch (error) {
                             console.error(`[${clientIdForReply}_HANDLER_INTERNAL_ERROR] Error during manual LID entry for ${lid}: ${error.message}`, error.stack);

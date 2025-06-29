@@ -134,6 +134,7 @@
 // database/botContactsDb.js
 const db = require('./db');
 let process = require('process');
+const{GET_FULL_CONTACT_BY_ANY_JID, UPDATE_WHITELIST_USER_FROM_CONTACT } = require('./queries');
 
 // Define the SQL to call our new database function
 const UPSERT_BY_NAME_FUNCTION_CALL = `
@@ -149,6 +150,49 @@ const UPSERT_BY_NAME_FUNCTION_CALL = `
     );
 `;
 
+/**
+ * Ensures that when a contact's info is updated (e.g., name learned),
+ * that information is propagated to other related tables like whitelisted_users.
+ * @param {number} botInstanceId The numeric ID of the bot instance.
+ * @param {string} jid The JID (LID or phone) that triggered the update.
+ */
+async function ensureContactConsistency(botInstanceId, jid) {
+    if (!botInstanceId || !jid) return;
+
+    try {
+        // 1. Get the master contact record from bot_contacts
+        const contactRes = await db.query(GET_FULL_CONTACT_BY_ANY_JID, [botInstanceId, jid]);
+        if (contactRes.rows.length === 0) {
+            // No contact record to sync from, so we can't do anything.
+            return;
+        }
+
+        const masterContact = contactRes.rows[0];
+        const hasName = masterContact.display_name && masterContact.display_name !== masterContact.phone_number;
+        const hasPhoneJid = masterContact.user_jid;
+
+        // 2. If the master contact has a real name and a phone JID,
+        //    update the corresponding record in whitelisted_users.
+        if (hasName && hasPhoneJid) {
+            // This query finds the whitelisted_user record by the user_jid
+            // and updates its display_name and phone_number from the bot_contacts table.
+            const updateRes = await db.query(UPDATE_WHITELIST_USER_FROM_CONTACT, [
+                masterContact.id,
+                masterContact.display_name,
+                masterContact.user_jid.split('@')[0]
+            ]);
+
+            if (updateRes.rowCount > 0) {
+                console.log(`[DB_CONSISTENCY] Synced name for ${masterContact.user_jid} to whitelisted_users table.`);
+            }
+        }
+        
+        // 3. (Future) Propagate to other tables if needed (e.g., group_participants cache)
+
+    } catch (error) {
+        console.error(`[DB_CONSISTENCY_ERROR] Failed to ensure consistency for JID ${jid}: ${error.message}`);
+    }
+}
 /**
  * Fetches the numeric ID for a bot instance from its client_id string.
  * @param {string} [clientId] - The client ID (e.g., 'client_967...'). Defaults to process.env.CLIENT_ID.
@@ -269,5 +313,6 @@ module.exports = {
     getClientBotInstanceId,
     upsertBotContact,
     deleteStaleContactsForInstance,
-    getContactByJid
+    getContactByJid,
+    ensureContactConsistency
 };

@@ -23,7 +23,7 @@ module.exports = {
 
     DEFAULT_PHONE_COUNTRY_CODE: '967', // Default for Yemen
 
-    API_SYNC_INTERVAL_MS: 3600000, // 1 hour
+    API_SYNC_INTERVAL_MS: 5000, // 5 seconds
     RECONNECT_DELAY_MS: 5000, // 5 seconds
     MESSAGE_PROCESS_TIMEOUT_MS: 30000, // 30 seconds
 };

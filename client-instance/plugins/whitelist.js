@@ -44,9 +44,45 @@ async function loadWhitelistFromDb() {
     }
 }
 
+// In client-instance/plugins/whitelist.js
+
+// This function now performs a comprehensive check for any known JID of a user.
 async function isWhitelisted(jid) {
+    // First, perform the fast in-memory cache check on the provided JID.
     await loadWhitelistFromDb();
-    return whitelistCache.users.has(jid) || whitelistCache.groups.has(jid);
+    if (whitelistCache.users.has(jid) || whitelistCache.groups.has(jid)) {
+        return true; // Direct match found, we're done.
+    }
+
+    // If no direct match, and it's a user JID, let's check for linked JIDs.
+    if (jid.includes('@')) {
+        try {
+            const botInstanceId = await getBotInstanceId();
+            if (!botInstanceId) return false;
+
+            // Find the full contact record using the provided JID.
+            const { getContactByJid } = require('../../database/botContactsDb');
+            const contact = await getContactByJid(botInstanceId, jid);
+
+            if (contact) {
+                // Check if the associated phone JID is in the cache.
+                if (contact.user_jid && whitelistCache.users.has(contact.user_jid)) {
+                    return true;
+                }
+                // Check if the associated LID JID is in the cache.
+                if (contact.lid_jid && whitelistCache.users.has(contact.lid_jid)) {
+                    return true;
+                }
+            }
+        } catch(e) {
+            console.error(`[WHITELIST_DB_ERROR] Error during comprehensive whitelist check for ${jid}: ${e.message}`);
+            // Fallback to the simple check if the database fails.
+            return whitelistCache.users.has(jid) || whitelistCache.groups.has(jid);
+        }
+    }
+
+    // If all checks fail, they are not whitelisted.
+    return false;
 }
 
 async function addToWhitelist(jid) {
@@ -137,13 +173,29 @@ async function getLidToPhoneJidFromCache(lidJid) {
     }
 }
 
-// client-instance/plugins/whitelist.js
+/**
+ * Checks if a specific whitelisted user is allowed to interact in groups.
+ * @param {string} userJid The user's phone number JID.
+ * @returns {Promise<boolean>} True if allowed in groups, otherwise false.
+ */
+async function isAllowedInGroups(userJid) {
+    try {
+        const botInstanceId = await getBotInstanceId();
+        if (!botInstanceId || !userJid) {
+            return false;
+        }
 
-// This file should already have `const db = require('../../database/db');` at the top.
-// If not, please add it.
+        const { getUserPermissions } = require('../../database/queries');
+        const result = await db.query(getUserPermissions, [botInstanceId, userJid]);
+        
+        // Return the boolean value from the database, or false if no record was found.
+        return result.rows[0]?.allowed_in_groups || false;
 
-// Find the existing cacheLidToPhoneJid function and REPLACE IT with this code:
-
+    } catch (e) {
+        console.error(`[WHITELIST_ERROR] Failed to check group permissions for ${userJid}: ${e.message}`);
+        return false; // Default to not allowed on error
+    }
+}
 /**
  * Persists a manually resolved LID-to-PhoneJID mapping with enhanced logic.
  * It first checks if a contact record already exists for either JID. If so, it merges
@@ -285,6 +337,7 @@ module.exports = {
     getPendingLidIdentifications,
     getAskedLidsCache,
     savePendingIdsFile,
+    isAllowedInGroups,
     saveAskedLidsFile,
     formatJid: (number) => {
         if (!number) return null;

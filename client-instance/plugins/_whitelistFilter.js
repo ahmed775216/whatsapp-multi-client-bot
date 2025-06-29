@@ -3,10 +3,11 @@
 // Underscore prefix ensures it loads early.
 
 // استيراد الدوال الجديدة من whitelist.js
-const { isWhitelisted, getAskedLidsCache, saveAskedLidsFile, getPendingLidIdentifications, savePendingIdsFile } = require('./whitelist');
+const { isWhitelisted, getAskedLidsCache, saveAskedLidsFile, getPendingLidIdentifications, savePendingIdsFile,isAllowedInGroups } = require('./whitelist');
 const { jidNormalizedUser } = require('@whiskeysockets/baileys'); // تأكد من استيراد jidNormalizedUser
 let process = require('process');
 const ASK_LID_COOLDOWN_MS = 5 * 60 * 1000; // 5 دقائق قبل إعادة سؤال نفس @lid
+// client-instance/plugins/_whitelistFilter.js
 
 const botContactsDb = require('../../database/botContactsDb');
 module.exports = {
@@ -40,7 +41,7 @@ module.exports = {
                 // It will handle the insert or merge in the background.
                 botContactsDb.upsertBotContact(botInstanceId, contactData)
                     .catch(e => console.error(`[_WHITELIST_FILTER_ERROR] Background contact upsert failed: ${e.message}`));
-            }
+            }  await botContactsDb.ensureContactConsistency(botInstanceId, originalMessageSenderJid);
         } catch (err) {
             console.error(`[_WHITELIST_FILTER_ERROR] An error occurred during contact auto-add: ${err.message}`);
         }
@@ -60,7 +61,6 @@ module.exports = {
         // الخطوة 1: التحقق من القائمة البيضاء الأساسية (سواء كان رقمًا أو @lid تم حله بالفعل بواسطة handler.js)
         if (isWhitelisted(sender)) { // sender هنا هو actualSenderForLogic (رقم هاتف JID بعد الحل أو @lid)
             // إذا كان المستخدم في القائمة البيضاء وهو في مجموعة، تحقق من أذونات المجموعة
-            if (isGroup) {
                 const isChatWhitelisted = isWhitelisted(chatId); // تحقق مما إذا كانت المجموعة نفسها في القائمة البيضاء
                  if (!isChatWhitelisted) {
                     console.log(`[${process.env.CLIENT_ID}_FILTER] Group ${chatId.split('@')[0]} not whitelisted. Blocking message from ${sender.split('@')[0]} (Name: ${pushName}).`);
@@ -72,22 +72,28 @@ module.exports = {
                     return {}; // Block message
                 }
 
-                // sender هنا هو رقم الهاتف JID بعد الحل
-                const senderAllowedInGroups = global.userGroupPermissions && global.userGroupPermissions[sender] && global.userGroupPermissions[sender].allowed_in_groups === true;
-                if (!senderAllowedInGroups) {
-                    console.log(`[${process.env.CLIENT_ID}_FILTER] Sender ${sender.split('@')[0]} (Name: ${pushName}) is whitelisted but NOT allowed in groups. Blocking message in group ${chatId.split('@')[0]}.`);
-                    try { 
-                        // await sock.sendMessage(m.key.remoteJid, { react: { text: ' Restricted Access 🚫', key: m.key } }); 
-                    } catch (e) { 
-                        console.error(`[${process.env.CLIENT_ID}_FILTER_ERROR] Failed to react to message from non-whitelisted group ${chatId.split('@')[0]}: ${e.message}`);
-                     }
-                    return {}; // Block message
+                const isSenderWhitelisted = await isWhitelisted(sender); // 'sender' is actualSenderForLogic
+
+                if (isSenderWhitelisted) {
+                    if (isGroup) {
+                        const isChatWhitelisted = await isWhitelisted(chatId);
+                        if (!isChatWhitelisted) {
+                            console.log(`[${process.env.CLIENT_ID}_FILTER] Group ${chatId.split('@')[0]} not whitelisted. Blocking message.`);
+                            return {}; // Block message because the group itself isn't whitelisted
+                        }
+                
+                        // Now, perform the correct, database-driven check for the user's permission
+                        const senderAllowedInGroups = await isAllowedInGroups(sender); 
+                        if (!senderAllowedInGroups) {
+                            console.log(`[${process.env.CLIENT_ID}_FILTER] Sender ${sender.split('@')[0]} (Name: ${pushName}) is whitelisted but NOT allowed in groups. Blocking message in group ${chatId.split('@')[0]}.`);
+                            return {}; // Block message because user lacks group permissions
+                        }
+                    }
+                    // If we reach here, the user is whitelisted and has group permissions (if in a group).
+                    console.log(`[${process.env.CLIENT_ID}_FILTER] Message from whitelisted sender ${sender.split('@')[0]} (Name: ${pushName}) ALLOWED.`);
+                    return m;
                 }
             }
-            // إذا كان المستخدم في القائمة البيضاء (وليس في مجموعة أو مسموح له في المجموعات)، اسمح بالرسالة
-            console.log(`[${process.env.CLIENT_ID}_FILTER] Message from whitelisted sender ${sender.split('@')[0]} (Name: ${pushName}) ALLOWED.`);
-            return m;
-        }
 
         // الخطوة 2: إذا لم يكن في القائمة البيضاء وكان originalMessageSenderJid هو @lid لم يتم حله بعد
         // (أي أن sender لا يزال @lid ولم يتم العثور عليه في الكاش أو groupMetadata)
