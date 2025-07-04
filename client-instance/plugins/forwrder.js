@@ -26,6 +26,7 @@ function generateSourcePackageName() {
     }
     return result;
 }
+ // Export the function for use in other modules
 
 module.exports = {
     // UPDATED: 'sock' parameter removed from the function signature

@@ -84,7 +84,7 @@ async function isWhitelisted(jid) {
     // If all checks fail, they are not whitelisted.
     return false;
 }
-
+/* 
 async function addToWhitelist(jid) {
     const botInstanceId = await getBotInstanceId();
     if (!botInstanceId) {
@@ -119,8 +119,89 @@ async function addToWhitelist(jid) {
         console.error('[WHITELIST] Error adding to whitelist:', error);
         return { success: false, reason: error.message };
     }
+} */
+// In client-instance/plugins/whitelist.js
+/**
+ * Checks if a specific whitelisted user is allowed to interact in groups.
+ * @param {string} userJid The user's phone number JID.
+ * @returns {Promise<boolean>} True if allowed in groups, otherwise false.
+ */
+async function isAllowedInGroups(userJid) {
+    try {
+        const botInstanceId = await getBotInstanceId();
+        if (!botInstanceId || !userJid) return false;
+
+        const result = await db.query(
+            'SELECT allowed_in_groups FROM whitelisted_users WHERE bot_instance_id = $1 AND user_jid = $2 AND api_active = true',
+            [botInstanceId, userJid]
+        );
+        return result.rows[0]?.allowed_in_groups || false;
+    } catch (e) {
+        console.error(`[WHITELIST_ERROR] Failed to check group permissions for ${userJid}: ${e.message}`);
+        return false;
+    }
 }
 
+/**
+ * Checks if a specific whitelisted user is allowed to interact in DMs.
+ * @param {string} userJid The user's JID.
+ * @returns {Promise<boolean>} True if allowed in DMs, otherwise false.
+ */
+async function isAllowedInDm(userJid) {
+    try {
+        const botInstanceId = await getBotInstanceId();
+        if (!botInstanceId || !userJid) return false;
+
+        const result = await db.query(
+            'SELECT allowed_in_dm FROM whitelisted_users WHERE bot_instance_id = $1 AND user_jid = $2 AND api_active = true',
+            [botInstanceId, userJid]
+        );
+        return result.rows[0]?.allowed_in_dm ?? false; // Default to false if not found
+    } catch (e) {
+        console.error(`[WHITELIST_ERROR] Failed to check DM permissions for ${userJid}: ${e.message}`);
+        return false;
+    }
+}
+
+async function addToWhitelist(jid) {
+    const botInstanceId = await getBotInstanceId();
+    if (!botInstanceId) {
+        return { success: false, reason: 'no_bot_instance' };
+    }
+
+    try {
+        const isGroup = jid.endsWith('@g.us');
+
+        if (isGroup) {
+            // Check if the group already exists.
+            const findRes = await db.query('SELECT id FROM whitelisted_groups WHERE bot_instance_id = $1 AND group_jid = $2', [botInstanceId, jid]);
+
+            if (findRes.rows.length > 0) {
+                // If it exists, UPDATE it to ensure it's active.
+                await db.query('UPDATE whitelisted_groups SET is_active = true, updated_at = CURRENT_TIMESTAMP WHERE bot_instance_id = $1 AND group_jid = $2', [botInstanceId, jid]);
+            } else {
+                // If it does not exist, INSERT a new record.
+                await db.query('INSERT INTO whitelisted_groups (bot_instance_id, group_jid, is_active) VALUES ($1, $2, true)', [botInstanceId, jid]);
+            }
+        } else { // This is a user JID
+            const findRes = await db.query('SELECT id FROM whitelisted_users WHERE bot_instance_id = $1 AND user_jid = $2', [botInstanceId, jid]);
+            
+            if (findRes.rows.length > 0) {
+                // If user exists, re-activate them for both DM and groups by default when added manually.
+                await db.query('UPDATE whitelisted_users SET api_active = true, allowed_in_dm = true, allowed_in_groups = true, updated_at = CURRENT_TIMESTAMP WHERE bot_instance_id = $1 AND user_jid = $2', [botInstanceId, jid]);
+            } else {
+                // If user does not exist, insert them with default active permissions.
+                await db.query('INSERT INTO whitelisted_users (bot_instance_id, user_jid, phone_number, api_active, allowed_in_dm, allowed_in_groups) VALUES ($1, $2, $3, true, true, true)', [botInstanceId, jid, jid.split('@')[0]]);
+            }
+        }
+
+        whitelistCache.lastLoaded = 0; // Invalidate cache to force a DB reload.
+        return { success: true };
+    } catch (error) {
+        console.error('[WHITELIST] Error adding to whitelist:', error);
+        return { success: false, reason: error.message };
+    }
+}
 async function removeFromWhitelist(jid) {
     const botInstanceId = await getBotInstanceId();
     if (!botInstanceId) {
@@ -178,7 +259,7 @@ async function getLidToPhoneJidFromCache(lidJid) {
  * @param {string} userJid The user's phone number JID.
  * @returns {Promise<boolean>} True if allowed in groups, otherwise false.
  */
-async function isAllowedInGroups(userJid) {
+/* async function isAllowedInGroups(userJid) {
     try {
         const botInstanceId = await getBotInstanceId();
         if (!botInstanceId || !userJid) {
@@ -195,7 +276,7 @@ async function isAllowedInGroups(userJid) {
         console.error(`[WHITELIST_ERROR] Failed to check group permissions for ${userJid}: ${e.message}`);
         return false; // Default to not allowed on error
     }
-}
+} */
 /**
  * Persists a manually resolved LID-to-PhoneJID mapping with enhanced logic.
  * It first checks if a contact record already exists for either JID. If so, it merges
@@ -338,6 +419,7 @@ module.exports = {
     getAskedLidsCache,
     savePendingIdsFile,
     isAllowedInGroups,
+    isAllowedInDm,
     saveAskedLidsFile,
     formatJid: (number) => {
         if (!number) return null;
