@@ -11,7 +11,20 @@ const ALL_HANDLERS_FROM_PLUGINS = [
     require('./plugins/_whitelistFilter.js').all,
     forwarderPlugin.all
 ];
-
+const fetch = require('node-fetch'); 
+// Add this function in forwarder.js
+function stripCountryCode(fullNumber, countryCode = '967') {
+    if (!fullNumber) return '';
+    const numberPart = fullNumber.toString().replace(/[^0-9]/g, '');
+    if (numberPart.startsWith(countryCode)) {
+        return numberPart.substring(countryCode.length);
+    }
+    return numberPart;
+}
+const FormData = require('form-data');
+const { getApiToken } = require('./lib/apiSync');
+const receiptState = require('./lib/receiptState'); // Our new state module
+// const { stripCountryCode } = require('./plugins/forwrder');
 async function handleMessage(sock, m, options = {}) {
     const isInternalCommand = options.isInternalCommand || false;
     const internalReply = options.internalReply || null;
@@ -426,7 +439,7 @@ async function handleMessage(sock, m, options = {}) {
 
     console.log(`[${process.env.CLIENT_ID}_HANDLER] MSG From: ${typeof actualSenderForLogic === 'string' ? actualSenderForLogic.split('@')[0] : actualSenderForLogic} (LID?: ${originalMessageSenderJid}, Name: ${pushName}) in ${isGroup ? 'Group: ' + (groupMetadata.subject || chatId.split('@')[0]) : 'DM'}. IsOwner: ${isOwner}.`);
 
-    // m.reply = (text, targetChatId = m.key.remoteJid, replyOptions = {}) => sock.sendMessage(targetChatId, (typeof text === 'string') ? { text: text } : text, { quoted: m, ...replyOptions });
+    // console.log = (text, targetChatId = m.key.remoteJid, replyOptions = {}) => sock.sendMessage(targetChatId, (typeof text === 'string') ? { text: text } : text, { quoted: m, ...replyOptions });
     const msgContextInfo = m.message?.[msgType]?.contextInfo;
     m.mentionedJid = msgContextInfo?.mentionedJid || [];
     if (m.message?.[msgType]?.contextInfo?.quotedMessage) {
@@ -458,7 +471,7 @@ async function handleMessage(sock, m, options = {}) {
                 askedLidsMap.delete(originalMessageSenderJid);
                 saveAskedLidsFile();
 
-                // await m.reply(`شكرًا لك ${pushName || ''}! تم التحقق من رقمك (${providedPhoneNumber}). يمكنك الآن استخدام خدمات البوت. يرجى إعادة إرسال طلبك الأصلي إذا لم تتم معالجته.`);
+                // await console.log(`شكرًا لك ${pushName || ''}! تم التحقق من رقمك (${providedPhoneNumber}). يمكنك الآن استخدام خدمات البوت. يرجى إعادة إرسال طلبك الأصلي إذا لم تتم معالجته.`);
 
                 // إرسال تحديث إلى المدير بالـ JID المحلول والاسم
                 const { reportLidResolution } = require('./clientBotApp'); // استيراد الدالة
@@ -470,7 +483,7 @@ async function handleMessage(sock, m, options = {}) {
                 return {};
             } else {
                 console.log(`[${process.env.CLIENT_ID}_HANDLER_IDENTIFY] Provided phone ${providedPhoneJid || providedPhoneNumber} by ${originalMessageSenderJid} (Name: ${pushName}) is NOT whitelisted.`);
-                // await m.reply(`عذرًا ${pushName || ''}! الرقم الذي قدمته (${providedPhoneNumber}) غير موجود في قائمة المستخدمين المصرح لهم. يرجى التأكد من الرقم أو التواصل مع المسؤول.`);
+                // await console.log(`عذرًا ${pushName || ''}! الرقم الذي قدمته (${providedPhoneNumber}) غير موجود في قائمة المستخدمين المصرح لهم. يرجى التأكد من الرقم أو التواصل مع المسؤول.`);
                 return {};
             }
         } else {
@@ -489,6 +502,82 @@ async function handleMessage(sock, m, options = {}) {
         botJid: botCanonicalJid,
         originalMessageSenderJid: originalMessageSenderJid
     };
+    try {
+        const amountRegex = /المبلغ:\s*(\d+(\.\d{1,2})?)/;
+        const textForAmountCheck = ctx.text || m.message?.documentMessage?.caption || '';
+        const amountMatch = textForAmountCheck.match(amountRegex);
+        const msgType = getContentType(m.message); // Get message type for document check
+
+        // --- Helper function to process and upload the receipt ---
+        async function processReceiptUpload(amount, documentMessage, senderJid) {
+            console.log(`[RECEIPT_HANDLER] Processing upload for amount '${amount}' from sender ${senderJid}.`);
+            const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB
+
+            try {
+                const fileBuffer = await m.download();
+                if (!fileBuffer || fileBuffer.length === 0) {
+                    throw new Error("Document download failed or resulted in an empty buffer.");
+                }
+
+                if (fileBuffer.length > MAX_FILE_SIZE_BYTES) {
+                    await console.log(`⚠️ عذراً، حجم الملف يتجاوز الحد المسموح به (5 ميغابايت).`);
+                    return;
+                }
+
+                const apiToken = getApiToken();
+                if (!apiToken) throw new Error("API token is not available.");
+
+                const senderPhoneNumber = stripCountryCode(senderJid.split('@')[0]);
+                const form = new FormData();
+                form.append('receipt_file', fileBuffer, { filename: documentMessage.fileName || 'receipt.pdf' });
+                form.append('amount', amount);
+                form.append('from_contact', senderPhoneNumber);
+
+                const response = await fetch(`${process.env.API_BASE_URL}/whats-transfers/receipt`, {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${apiToken}`, ...form.getHeaders() },
+                    body: form
+                });
+
+                if (response.ok) {
+                    await console.log(`✅ تم استلام الإيصال والمبلغ بنجاح.`);
+                } else {
+                    const errorText = await response.text();
+                    await console.log(`🚫 حدث خطأ أثناء معالجة الإيصال. [${response.status}]`);
+                    console.error(`[RECEIPT_HANDLER] API Error for ${senderJid}: ${response.status} - ${errorText}`);
+                }
+            } catch (error) {
+                await console.log(`🚫 عذراً، حدث خطأ فني أثناء معالجة طلبك.`);
+                console.error('[RECEIPT_HANDLER_CRITICAL] An error occurred:', error.message);
+            }
+        }
+
+        // CASE A: Message has "المبلغ:" and a document attached.
+        if (amountMatch && msgType === 'documentMessage') {
+            const amount = amountMatch[1];
+            await processReceiptUpload(amount, m.message.documentMessage, ctx.sender);
+            return; // Transaction handled, stop all further processing.
+        }
+
+        // CASE B: Message is only a document, check if an amount is pending for this sender.
+        const pending = receiptState.getPendingReceipt(ctx.sender);
+        if (pending && msgType === 'documentMessage') {
+            await processReceiptUpload(pending.amount, m.message.documentMessage, ctx.sender);
+            receiptState.clearPendingReceipt(ctx.sender);
+            return; // Transaction handled, stop all further processing.
+        }
+        
+        // CASE C: Message is only text containing "المبلغ:", set pending state.
+        if (amountMatch) {
+            const amount = amountMatch[1];
+            receiptState.addPendingReceipt(ctx.sender, amount);
+            await console.log(`تم استلام المبلغ: *${amount}*. \nالرجاء إرسال إيصال الـ PDF الآن.`);
+            return; // Stop processing, wait for the document.
+        }
+
+    } catch (e) {
+        console.error(`[HANDLER_RECEIPT_ERROR] Error in receipt handling logic: ${e.message}`, e.stack);
+    }
 
     for (const allHandler of ALL_HANDLERS_FROM_PLUGINS) {
         try {
@@ -514,7 +603,7 @@ async function handleMessage(sock, m, options = {}) {
                     const addResult = addToWhitelist(ctx.chatId);
                     console.log(addResult.success ? `Group ${ctx.groupMetadata.subject || ctx.chatId} added to whitelist.` : `Failed: ${addResult.reason}`);
                 } else {
-                    // m.reply(`This command can only be used in a group.`);
+                    // console.log(`This command can only be used in a group.`);
                 }
                 break;
             case '!removegroup':
@@ -522,7 +611,7 @@ async function handleMessage(sock, m, options = {}) {
                     const removeResult = removeFromWhitelist(ctx.chatId);
                     console.log(removeResult.success ? `Group ${ctx.groupMetadata.subject || ctx.chatId} removed from whitelist.` : `Failed: ${removeResult.reason}`);
                 } else {
-                    //  m.reply(`This command can only be used in a group.`);
+                    //  console.log(`This command can only be used in a group.`);
                 }
                 break;
             case '!addtochatwhitelist':
@@ -532,10 +621,10 @@ async function handleMessage(sock, m, options = {}) {
                         const addResult = addToWhitelist(jidToAdd);
                         console.log(addResult.success ? `${jidToAdd.split('@')[0]} added to general whitelist.` : `Failed: ${addResult.reason}`);
                     } else {
-                        //  m.reply(`Invalid JID format: ${args[0]}`);
+                        //  console.log(`Invalid JID format: ${args[0]}`);
                     }
                 } else {
-                    //  m.reply(`Usage: !addtochatwhitelist <phone_number_or_group_jid>`); 
+                    //  console.log(`Usage: !addtochatwhitelist <phone_number_or_group_jid>`); 
                 }
                 break;
             case '!removefromchatwhitelist':
@@ -545,10 +634,10 @@ async function handleMessage(sock, m, options = {}) {
                         const removeResult = removeFromWhitelist(jidToRemove);
                         console.log(removeResult.success ? `${jidToRemove.split('@')[0]} removed from general whitelist.` : `Failed: ${removeResult.reason}`);
                     } else {
-                        //  m.reply(`Invalid JID format: ${args[0]}`);
+                        //  console.log(`Invalid JID format: ${args[0]}`);
                     }
                 } else {
-                    //  m.reply(`Usage: !removefromchatwhitelist <phone_number_or_group_jid>`);
+                    //  console.log(`Usage: !removefromchatwhitelist <phone_number_or_group_jid>`);
                 }
                 break;
         }

@@ -98,7 +98,14 @@ UPDATE_BOT_CONTACT_MERGE: `
         synced_at = CURRENT_TIMESTAMP
     WHERE id = $1
 `,
-
+/* UPDATE_WHITELIST_USER_FROM_CONTACT: `
+    UPDATE whitelisted_users
+    SET
+        display_name = $2,
+        phone_number = $3
+    WHERE
+        bot_instance_id = $1 AND user_jid = $4
+`, */
 // Add this new query to get all resolutions to be synced:
 GET_ALL_LID_RESOLUTIONS: `
     SELECT lid_jid, resolved_phone_jid, display_name FROM lid_resolutions WHERE bot_instance_id = $1

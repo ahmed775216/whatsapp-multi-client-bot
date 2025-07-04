@@ -132,6 +132,7 @@
 //     getContactByJid,
 // };
 // database/botContactsDb.js
+
 const db = require('./db');
 let process = require('process');
 const{GET_FULL_CONTACT_BY_ANY_JID, UPDATE_WHITELIST_USER_FROM_CONTACT } = require('./queries');
@@ -161,7 +162,7 @@ async function ensureContactConsistency(botInstanceId, jid) {
 
     try {
         // 1. Get the master contact record from bot_contacts
-        const contactRes = await db.query(GET_FULL_CONTACT_BY_ANY_JID, [botInstanceId, jid]);
+        const contactRes = await db.query(GET_FULL_CONTACT_BY_ANY_JID, [botInstanceId, jid, jid]);
         if (contactRes.rows.length === 0) {
             // No contact record to sync from, so we can't do anything.
             return;
