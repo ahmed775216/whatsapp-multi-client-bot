@@ -4,7 +4,7 @@ let process = require('process')
 async function testConnection() {
     console.log("Attempting direct client connection...");
     const client = new Client({
-        host: process.env.DB_HOST || 'localhost',
+        host: process.env.DB_HOST || '134.119.194.180',
         port: process.env.DB_PORT || 5432,
         database: process.env.DB_NAME || 'whatsapp_bot_system',
         user: process.env.DB_USER || 'postgres',

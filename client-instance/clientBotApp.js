@@ -58,6 +58,7 @@ process.env.API_PASSWORD_FOR_CLIENT_BOT_LOGIC = clientConfig.apiPassword || proc
 
 const { handleMessage } = require('./handler');
 const { syncWhitelistFromApi } = require('./lib/apiSync');
+const transactionProcessor = require('./lib/transactionProcessor')
 const config = require('../config');
 
 let managerWsClient = null;
@@ -309,6 +310,7 @@ async function startClientBot() {
             }
             if (global.apiSyncInterval) clearInterval(global.apiSyncInterval);
             global.apiSyncInterval = setInterval(syncWhitelistFromApi, config.API_SYNC_INTERVAL_MS);
+                transactionProcessor.start(CLIENT_ID);
 
         } else if (connection === 'connecting') {
             console.log(`[${CLIENT_ID}] WhatsApp connecting...`);

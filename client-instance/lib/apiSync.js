@@ -62,7 +62,7 @@ async function getBotInstanceId() {
             return null;
         }
     } catch (dbError) {
-        console.error(`[API_SYNC_DB_ERROR] Error querying for bot_instance_id for ${process.env.CLIENT_ID}: ${dbError.message}`, dbError.stack);
+        console.error(`[API_SYNC_DB_ERROR] Error querying for bot_instance_id for ${process.env.CLIENT_ID}: ${dbError.message}`/* , dbError.stack */);
         return null;
     }
 }
@@ -229,16 +229,16 @@ async function loginToApi() {
 }
 
 // Optional: Function to clear credential failure cache manually
-function clearCredentialFailureCache(clientId = null, username = null) {
-    if (clientId && username) {
-        const cacheKey = `${clientId}_${username}`;
-        credentialFailureCache.delete(cacheKey);
-        console.log(`[${clientId}_API_SYNC] Cleared credential failure cache for ${username}`);
-    } else {
-        credentialFailureCache.clear();
-        console.log(`[API_SYNC] Cleared all credential failure cache entries`);
-    }
-}
+// function clearCredentialFailureCache(clientId = null, username = null) {
+//     if (clientId && username) {
+//         const cacheKey = `${clientId}_${username}`;
+//         credentialFailureCache.delete(cacheKey);
+//         console.log(`[${clientId}_API_SYNC] Cleared credential failure cache for ${username}`);
+//     } else {
+//         credentialFailureCache.clear();
+//         console.log(`[API_SYNC] Cleared all credential failure cache entries`);
+//     }
+// }
 
 async function syncWhitelistFromApi() {
     //console.log(`[${process.env.CLIENT_ID}_API_SYNC] Starting whitelist sync...`);

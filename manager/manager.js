@@ -1,6 +1,7 @@
 // manager/manager.js
 const path = require('path');
 // const fs = require('fs');
+// eslint-disable-next-line no-undef
 require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 let process = require('process');
 const config = require('../config');
