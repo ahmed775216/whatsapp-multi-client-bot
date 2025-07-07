@@ -12,7 +12,7 @@ const loggerCache = new Map();
  * @param {string} clientId The unique identifier for the client instance.
  * @returns {pino.Logger} The configured Pino logger instance.
  */
-function createLogger(clientId) {
+function createLogger(clientId, fileName = 'processing.log') {
     // If a logger for this client already exists in our cache, return it immediately.
     if (loggerCache.has(clientId)) {
         return loggerCache.get(clientId);
@@ -22,7 +22,7 @@ function createLogger(clientId) {
     // eslint-disable-next-line no-undef
     const logsBaseDir = path.join(__dirname, '..', '..', 'Logs');
     const clientLogDir = path.join(logsBaseDir, clientId);
-    const logFilePath = path.join(clientLogDir, 'processing.log');
+    const logFilePath = path.join(clientLogDir, fileName);
 
     // Ensure the specific client's log directory exists.
     try {
@@ -41,19 +41,17 @@ function createLogger(clientId) {
     const transport = pino.transport({
         targets: [
             {
-                level: 'info',
+                // Target 1: File transport for machine-readable JSON logs.
+                // This format is ideal for log analysis tools.
+                level: 'debug',
                 target: 'pino/file', // Use pino's built-in file transport
                 options: {
                     destination: logFilePath, 
-                    mkdir: true,
-                    colorize: true,
-                    translateTime: 'SYS:yyyy-mm-dd HH:MM:ss',
-                    ignore: 'pid,hostname',
-
-
+                    mkdir: true, // Ensure the directory exists
                 },
             },
             {
+                // Target 2: Console transport for human-readable, colorized logs.
                 level: 'info',
                 target: 'pino-pretty', // For colorful console output in PM2
                 options: {
@@ -67,7 +65,7 @@ function createLogger(clientId) {
 
     const logger = pino({
         // eslint-disable-next-line no-undef
-        level: process.env.LOG_LEVEL || 'info',
+        level: process.env.LOG_LEVEL || 'debug',
     }, transport);
 
     // Add the new logger to the cache for future requests.

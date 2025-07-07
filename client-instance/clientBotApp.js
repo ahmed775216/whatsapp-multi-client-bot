@@ -1,37 +1,29 @@
 // client-instance/clientBotApp.js
 const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, jidNormalizedUser } = require('@whiskeysockets/baileys');
-const pino = require('pino');
 const path = require('path'); // Ensure path is required correctly
 const fs = require('fs');
 const WebSocket = require('ws');
 const { upsertBotContact, getClientBotInstanceId } = require('../database/botContactsDb');
 let process = require('process');
+const { createLogger } = require('./lib/logger');
+
 const AUTH_DIR = process.env.AUTH_DIR;
 const DATA_DIR = process.env.DATA_DIR;
 const CLIENT_ID = process.env.CLIENT_ID;
-console.log(`[CLIENT_APP_INIT_DEBUG] Instance started with CLIENT_ID from env: '${CLIENT_ID}' (Type: ${typeof CLIENT_ID})`);
 const MANAGER_WS_PORT = parseInt(process.env.MANAGER_WS_PORT || '0');
-// client-instance/clientBotApp.js
 
-// ... after const MANAGER_WS_PORT = ...
-
-let botInstanceId = null; // <-- ADD THIS
-(async () => { // <-- ADD THIS IIFE WRAPPER
-    try {
-        botInstanceId = await getClientBotInstanceId(CLIENT_ID);
-        if (!botInstanceId) {
-            console.error(`[${CLIENT_ID}_FATAL] Could not retrieve botInstanceId from database on startup. Contact persistence will fail.`);
-        } else {
-            console.log(`[${CLIENT_ID}] Bot Instance ID for contact persistence: ${botInstanceId}`);
-        }
-    } catch (e) {
-        console.error(`[${CLIENT_ID}_FATAL] Database error getting botInstanceId on startup: ${e.message}`);
-    }
-})();
 if (!AUTH_DIR || !DATA_DIR || !CLIENT_ID || MANAGER_WS_PORT === 0) { // Ensure CLIENT_ID here is also checked
+    // We can't use the main logger here because CLIENT_ID might be missing.
+    // A simple console.error is appropriate for this fatal, pre-startup error.
     console.error(`[${CLIENT_ID || 'UNKNOWN_CLIENT'}_FATAL] Missing required environment variables. AUTH_DIR=${AUTH_DIR}, DATA_DIR=${DATA_DIR}, CLIENT_ID=${CLIENT_ID}, MANAGER_WS_PORT=${MANAGER_WS_PORT}. Exiting.`);
     process.exit(1);
 }
+
+// Initialize the logger now that we have a guaranteed CLIENT_ID
+const logger = createLogger(CLIENT_ID, 'client.log');
+logger.info({ clientId: CLIENT_ID, type: typeof CLIENT_ID }, 'Instance process started.');
+
+
 
 if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -40,14 +32,15 @@ if (!global.pushNameCache) { // كاش لتخزين pushName مؤقتًا
     global.pushNameCache = new Map();
 }
 
-// const botContactsDb = require('../database/botContactsDb'); // Import the new module
 const { findBestDisplayName } = require('./lib/contactUtils'); // Import the utility function
 let clientConfig = {};
 const clientConfigPath = path.join(path.dirname(AUTH_DIR), 'client_config.json');
 if (fs.existsSync(clientConfigPath)) {
     try {
         clientConfig = JSON.parse(fs.readFileSync(clientConfigPath, 'utf8'));
-    } catch (e) { console.error(`[${CLIENT_ID}] Error loading client_config.json:`, e.message); }
+    } catch (e) { 
+        logger.error({ err: e, path: clientConfigPath }, 'Error loading client_config.json'); 
+    }
 }
 
 process.env.DATA_DIR_FOR_CLIENT = DATA_DIR;
@@ -65,17 +58,18 @@ let managerWsClient = null;
 let reconnectManagerWsInterval = null;
 let sock = null;
 async function fetchAndSaveContacts() {
-    console.log(`[${CLIENT_ID}] Starting manual contact sync...`);
+    logger.info('Starting manual contact sync...');
     if (!botInstanceId) {
-        console.error(`[${CLIENT_ID}_CONTACTS_SYNC_ERROR] Bot Instance ID not available. Aborting sync.`);
+        logger.error('Bot Instance ID not available for contact sync. Aborting.');
         return;
     }
 
     try {
         const contactsMap = sock.contacts || {};
         const allSyncedUserJids = [];
+        const contactCount = Object.keys(contactsMap).length;
 
-        console.log(`[${CLIENT_ID}_CONTACTS_SYNC] Processing ${Object.keys(contactsMap).length} contacts from address book.`);
+        logger.info({ contactCount }, `Processing ${contactCount} contacts from address book.`);
 
         for (const jid in contactsMap) {
             const contact = contactsMap[jid];
@@ -105,8 +99,8 @@ async function fetchAndSaveContacts() {
                         displayName: displayName,
                         whatsappName: contact.notify || contact.pushName || null,
                         isWhatsappContact: true,
-                        isSavedContact: true // <<< CRITICAL: These are "saved" contacts.
-                    };
+                        isSavedContact: true
+                     };
 
                     await upsertBotContact(botInstanceId, contactData);
                 }
@@ -114,12 +108,12 @@ async function fetchAndSaveContacts() {
         }
 
         // Mark any saved contacts that were not in this sync as inactive.
-        console.log(`[${CLIENT_ID}_CONTACTS_SYNC] Finished upserting contacts. Now checking for stale contacts...`);
+        logger.info('Finished upserting contacts. Now checking for stale contacts...');
         await require('../database/botContactsDb').deleteStaleContactsForInstance(botInstanceId, allSyncedUserJids);
 
-        console.log(`[${CLIENT_ID}_CONTACTS_SYNC] Manual contact sync completed.`);
+        logger.info('Manual contact sync completed.');
     } catch (error) {
-        console.error(`[${CLIENT_ID}_CONTACTS_SYNC_ERROR] An error occurred during contact sync: ${error.message}`, error.stack);
+        logger.error({ err: error }, 'An error occurred during contact sync.');
     }
 }
 
@@ -132,14 +126,26 @@ function connectToManagerWebSocket() {
 
     managerWsClient = new WebSocket(`ws://localhost:${MANAGER_WS_PORT}`);
 
-    managerWsClient.onopen = () => {
-        console.log(`[${CLIENT_ID}] Connected to manager WS.`);
+    managerWsClient.onopen = async () => {
+        logger.info('Connected to manager WS.');
+
+        try {
+            botInstanceId = await getClientBotInstanceId(CLIENT_ID);
+            if (!botInstanceId) {
+                logger.error('Could not retrieve botInstanceId from database on startup. Contact persistence will fail.');
+            } else {
+                logger.info({ botInstanceId }, 'Bot Instance ID for contact persistence retrieved.');
+            }
+        } catch (e) {
+            logger.error({ err: e }, 'Database error getting botInstanceId on startup.');
+        }
+
         reportToManager('status', {
             status: 'connecting_whatsapp', // More specific initial status
             message: `Client ${CLIENT_ID} bot instance started, attempting WhatsApp connection.`,
         });
         startClientBot().catch(err => {
-            console.error(`[${CLIENT_ID}] Critical Error starting client bot:`, err.message, err.stack);
+            logger.fatal({ err }, `Critical Error starting client bot. Exiting.`);
             reportToManager('status', {
                 status: 'error_startup', message: `Client bot ${CLIENT_ID} failed to start: ${err.message}`,
             });
@@ -152,18 +158,18 @@ function connectToManagerWebSocket() {
         try {
             const parsedMsg = JSON.parse(event.data.toString()); // Ensure it's a string
             if (parsedMsg.type === 'internalCommand' && parsedMsg.clientId === CLIENT_ID) {
-                console.log(`[${CLIENT_ID}] Received internal command from manager: ${parsedMsg.command} with payload:`, { groupId: parsedMsg.groupId, participantJid: parsedMsg.participantJid });
+                logger.info({ command: parsedMsg.command, payload: { groupId: parsedMsg.groupId, participantJid: parsedMsg.participantJid } }, 'Received internal command from manager');
 
                 const internalReply = (dataForReply) => {
                     if (managerWsClient && managerWsClient.readyState === WebSocket.OPEN) {
                         managerWsClient.send(JSON.stringify({ type: 'internalReply', clientId: CLIENT_ID, data: dataForReply }));
                     } else {
-                        console.warn(`[${CLIENT_ID}] Manager WS not open, cannot send internal reply for command ${parsedMsg.command}.`);
+                        logger.warn({ command: parsedMsg.command }, `Manager WS not open, cannot send internal reply for command ${parsedMsg.command}.`);
                     }
                 };
 
                 if (!sock) {
-                    console.error(`[${CLIENT_ID}] Sock is not initialized. Cannot process internal command ${parsedMsg.command}.`);
+                    logger.error({ command: parsedMsg.command }, `Sock is not initialized. Cannot process internal command ${parsedMsg.command}.`);
                     internalReply({ type: 'error', message: 'WhatsApp connection not ready.', clientId: CLIENT_ID });
                     return;
                 }
@@ -181,18 +187,18 @@ function connectToManagerWebSocket() {
                     clientId: CLIENT_ID,
                 });
             } else if (parsedMsg.clientId === CLIENT_ID) {
-                // console.log(`[${CLIENT_ID}] Manager message (type: ${parsedMsg.type}): ${event.data.toString().substring(0,150)}`); // Can be noisy
+                // logger.debug({ type: parsedMsg.type, data: event.data.toString().substring(0,150) }, 'Manager message'); // Can be noisy
             } else if (parsedMsg.type !== 'internalCommand') { // General messages not for this client specifically
-                // console.log(`[${CLIENT_ID}] Received general manager message: ${event.data.toString().substring(0,100)}`);
+                // logger.debug({ data: event.data.toString().substring(0,100) }, 'Received general manager message');
             }
         } catch (error) {
-            console.error(`[${CLIENT_ID}] Error processing manager message: ${error.message}. Raw: ${event.data.toString().substring(0, 200)}`);
+            logger.error({ err: error, rawData: event.data.toString().substring(0, 200) }, 'Error processing manager message');
         }
     };
 
     // In clientBotApp.js, update the reconnection logic:
     managerWsClient.onclose = () => {
-        console.log(`[${CLIENT_ID}] Disconnected from manager WS. Attempting to reconnect...`);
+        logger.warn('Disconnected from manager WS. Attempting to reconnect...');
         reportToManager('status', { status: 'disconnected_manager_ws', message: `Client ${CLIENT_ID} lost connection to manager.` });
 
         // Clear any existing interval first
@@ -204,7 +210,7 @@ function connectToManagerWebSocket() {
         // Set up reconnection with proper check
         reconnectManagerWsInterval = setInterval(() => {
             if (!managerWsClient || managerWsClient.readyState === WebSocket.CLOSED || managerWsClient.readyState === WebSocket.CLOSING) {
-                console.log(`[${CLIENT_ID}] Retrying manager WS connection...`);
+                logger.info('Retrying manager WS connection...');
                 connectToManagerWebSocket();
             } else if (managerWsClient.readyState === WebSocket.OPEN) {
                 // Already connected, clear the interval
@@ -215,7 +221,7 @@ function connectToManagerWebSocket() {
     };
 
     managerWsClient.onerror = (error) => {
-        console.error(`[${CLIENT_ID}] Manager WS Error:`, error.message);
+        logger.error({ err: error }, 'Manager WS Error');
         // No need to call managerWsClient.close() here, onclose will handle it.
     };
 }
@@ -225,12 +231,13 @@ function reportToManager(type, data = {}) { // تغيير اسم الدالة ل
         const payload = { type: type, clientId: CLIENT_ID, data: data };
         try {
             managerWsClient.send(JSON.stringify(payload));
-            console.log(`[${CLIENT_ID}] Reported to manager: type=${type}, data keys: ${Object.keys(data).join(', ')}`);
+            // Use debug level for this frequent operation to avoid noisy logs in production.
+            logger.debug({ reportType: type, dataKeys: Object.keys(data) }, 'Reported to manager');
         } catch (e) {
-            console.error(`[${CLIENT_ID}] Error sending to manager (type: ${type}): `, e.message);
+            logger.error({ err: e, reportType: type }, 'Error sending report to manager');
         }
     } else {
-        console.warn(`[${CLIENT_ID}] Manager WS not open, cannot report ${type}.`);
+        logger.warn({ reportType: type }, 'Manager WS not open, cannot send report.');
     }
 }
 
@@ -246,28 +253,29 @@ module.exports = { reportLidResolution }; // تصدير الدالة
 
 
 async function startClientBot() {
-    console.log(`[${CLIENT_ID}] Initializing Baileys connection...`);
-    // reportToManager('status', { status: 'initializing_baileys', message: `Client ${CLIENT_ID} initializing WhatsApp.` });
-
+    logger.info('Initializing Baileys connection...');
 
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     const { version } = await fetchLatestBaileysVersion();
 
+    // Create a child logger for Baileys, so its logs are integrated into our system.
+    // It will be silent by default unless you set a specific LOG_LEVEL.
+    const baileysLogger = logger.child({ module: 'baileys' });
+    baileysLogger.level = process.env.LOG_LEVEL || 'silent';
+
     sock = makeWASocket({ // Assign to the higher-scoped sock
         version,
-        logger: pino({ level: process.env.LOG_LEVEL }), // Default to silent to reduce noise
+        logger: baileysLogger,
         auth: state,
         browser: [`Client-${CLIENT_ID.substring(0, 10)}`, 'Chrome', '1.0'],
         printQRInTerminal: false, // We send QR to manager
-        // SyncFullHistory: false, // Consider disabling if not needed for performance
-        // ConnectTimeoutMs: 60000, // Longer timeout
     });
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            console.log(`[${CLIENT_ID}] New QR code received. Reporting to manager.`);
+            logger.info('New QR code received. Reporting to manager.');
             reportToManager('qr', qr); // Send QR data (string)
             reportToManager('status', { status: 'qr_received', message: `Client ${CLIENT_ID} QR ready. Scan needed.` });
         }
@@ -276,44 +284,55 @@ async function startClientBot() {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             const reason = DisconnectReason[statusCode] || `Unknown (${statusCode})`;
-            console.log(`[${CLIENT_ID}] WhatsApp connection closed. Reason: ${reason}. Should Reconnect: ${shouldReconnect}`);
+            logger.warn({ reason, statusCode, shouldReconnect }, 'WhatsApp connection closed.');
             reportToManager('status', { status: 'disconnected_whatsapp', message: `Client ${CLIENT_ID} disconnected from WhatsApp (${reason}).` });
 
 
             if (statusCode === DisconnectReason.loggedOut) {
-                console.log(`[${CLIENT_ID}] Logged out by WhatsApp. Clearing auth and exiting.`);
-                try { if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (e) { console.error(`[${CLIENT_ID}] Error cleaning auth dir:`, e.message); }
+                logger.warn('Logged out by WhatsApp. Clearing auth and exiting.');
+                try { if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (e) { logger.error({ err: e }, 'Error cleaning auth dir during logout.'); }
                 reportToManager('status', { status: 'disconnected_logout', message: `Client ${CLIENT_ID} logged out by WhatsApp.` });
                 process.exit(0); // Exit cleanly
             } else if (shouldReconnect) {
-                console.log(`[${CLIENT_ID}] Attempting to reconnect to WhatsApp in 5s...`);
+                logger.info(`Attempting to reconnect to WhatsApp in ${config.RECONNECT_DELAY_MS / 1000}s...`);
                 reportToManager('status', { status: 'reconnecting_whatsapp', message: `Client ${CLIENT_ID} reconnecting to WhatsApp...` });
                 setTimeout(() => startClientBot(), config.RECONNECT_DELAY_MS); // Use configured delay
             } else {
-                console.error(`[${CLIENT_ID}] Unrecoverable WhatsApp connection error. Error: ${lastDisconnect?.error?.message}`);
+                logger.error({ err: lastDisconnect?.error }, 'Unrecoverable WhatsApp connection error.');
                 reportToManager('status', { status: 'error_whatsapp_permanent', message: `Client ${CLIENT_ID} permanent WhatsApp connection error.` });
                 process.exit(1); // Exit with error
             }
         } else if (connection === 'open') {
             const phoneNumber = jidNormalizedUser(sock.user?.id || '').split('@')[0];
             const clientName = sock.user?.name || `Client-${phoneNumber || CLIENT_ID.substring(0, 10)}`;
-            console.log(`[${CLIENT_ID}] Connected to WhatsApp! Phone: ${phoneNumber}, Name: ${clientName}`);
+            logger.info({ phoneNumber, clientName }, 'Connected to WhatsApp!');
             reportToManager('status', {
                 status: 'connected_whatsapp', message: `Client ${phoneNumber || CLIENT_ID} connected to WhatsApp.`,
                 phoneNumber: phoneNumber, name: clientName,
             });
             // await fetchAndSaveContacts();
-            if (!config.SKIP_API_SYNC_ON_RECONNECT || !global.initialApiSyncDone) { // Allow skipping if configured
-                console.log(`[${CLIENT_ID}] Starting API sync for client-specific whitelist.`);
-                await syncWhitelistFromApi();
-                global.initialApiSyncDone = true;
-            }
-            if (global.apiSyncInterval) clearInterval(global.apiSyncInterval);
-            global.apiSyncInterval = setInterval(syncWhitelistFromApi, config.API_SYNC_INTERVAL_MS);
-                transactionProcessor.start(CLIENT_ID);
+            const safeSyncWhitelist = async () => {
+                try {
+                    await syncWhitelistFromApi();
+                } catch (err) {
+                    logger.error({ err }, "An error occurred during the whitelist sync. The process will continue and retry later.");
+                }
+            };
 
+            if (!config.SKIP_API_SYNC_ON_RECONNECT || !global.initialApiSyncDone) {
+                logger.info('Starting initial API sync for client-specific whitelist.');
+                // Run the initial sync, but don't let it crash the app on failure.
+                await safeSyncWhitelist();
+                global.initialApiSyncDone = true; // Mark as done even on failure to prevent re-running on every reconnect.
+            }
+
+            if (global.apiSyncInterval) clearInterval(global.apiSyncInterval);
+            // Periodically sync in the background, safely.
+            global.apiSyncInterval = setInterval(safeSyncWhitelist, config.API_SYNC_INTERVAL_MS);
+
+            transactionProcessor.start(CLIENT_ID);
         } else if (connection === 'connecting') {
-            console.log(`[${CLIENT_ID}] WhatsApp connecting...`);
+            logger.info('WhatsApp connecting...');
             reportToManager('status', { status: 'connecting_whatsapp', message: `Client ${CLIENT_ID} connecting to WhatsApp...` });
         }
     });
@@ -339,11 +358,11 @@ async function startClientBot() {
     // This is the more reliable way to know when contacts are ready.
     let initialContactsSet = false; // Flag to ensure initial sync runs only once per session
     sock.ev.on('contacts.set', async ({ contacts }) => {
-        console.log(`[${CLIENT_ID}] contacts.set event received. Total: ${contacts.length}. Initial sync: ${!initialContactsSet}`);
+        logger.info({ total: contacts.length, initialSync: !initialContactsSet }, 'contacts.set event received.');
         // If this is the initial full set of contacts, or a subsequent large update.
         // We'll run fetchAndSaveContacts when a full set is received.
         if (!initialContactsSet) {
-            console.log(`[${CLIENT_ID}] Running initial contact sync due to contacts.set event.`);
+            logger.info('Running initial contact sync due to contacts.set event.');
             await fetchAndSaveContacts();
             initialContactsSet = true;
         }
@@ -369,11 +388,11 @@ async function startClientBot() {
         // This fires for individual contact updates (e.g., someone changes their name)
         // If you want to keep contacts highly synchronized, you'd handle granular updates here.
         // For simplicity and initial implementation, contacts.set handles the full sync.
-        console.log(`[${CLIENT_ID}] contacts.update event received for ${updates.length} contacts.`);
+        logger.info({ count: updates.length }, 'contacts.update event received.');
         // For now, let's trigger a full refresh on any update, as it's easier than granular updates.
         // For production, you might want to process `updates` more efficiently.
         if (sock.contacts && Object.keys(sock.contacts).length > 0) { // Only re-sync if contacts are generally available
-            console.log(`[${CLIENT_ID}] Re-syncing contacts due to update event.`);
+            logger.info('Re-syncing contacts due to update event.');
             await fetchAndSaveContacts();
         }
     });
@@ -382,34 +401,26 @@ async function startClientBot() {
     // Add a small delay after 'open' for initial contacts to load, then run a check.
     // This provides a safety net if contacts.set isn't reliably triggered for initial load.
     if (!initialContactsSet) {
-        console.log(`[${CLIENT_ID}] Scheduling a delayed fallback contact sync...`);
+        logger.info('Scheduling a delayed fallback contact sync...');
         setTimeout(async () => {
             if (!initialContactsSet) { // Only run if contacts.set hasn't triggered it yet
-                console.log(`[${CLIENT_ID}] Running delayed fallback contact sync.`);
+                logger.info('Running delayed fallback contact sync.');
                 await fetchAndSaveContacts();
                 initialContactsSet = true;
             }
         }, 10000); 4
     }
 }
-// --- Main Execution ---
 connectToManagerWebSocket(); // Connect to manager first
-// startClientBot().catch(err => {
-//     console.error(`[${CLIENT_ID}] Critical Error starting client bot:`, err.message, err.stack);
-//     reportToManager('status', {
-//         status: 'error_startup', message: `Client bot ${CLIENT_ID} failed to start: ${err.message}`,
-//     });
-//     process.exit(1);
-// });
 
 process.on('SIGINT', () => {
-    console.log(`[${CLIENT_ID}] SIGINT received, shutting down...`);
+    logger.info('SIGINT received, shutting down...');
     if (sock) sock.end(new Error('SIGINT Shutdown'));
     if (managerWsClient) managerWsClient.close();
     process.exit(0);
 });
 process.on('SIGTERM', () => {
-    console.log(`[${CLIENT_ID}] SIGTERM received, shutting down...`);
+    logger.info('SIGTERM received, shutting down...');
     if (sock) sock.end(new Error('SIGTERM Shutdown'));
     if (managerWsClient) managerWsClient.close();
     process.exit(0);

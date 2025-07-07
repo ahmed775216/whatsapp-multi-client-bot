@@ -2,14 +2,15 @@ const fetch = require('node-fetch');
 const { getApiToken, loginToApi } = require('./apiSync');
 const transactionStore = require('./transactionStore');
 const { createLogger } = require('./logger');
+// const { v4: uuidv4 } = require('uuid'); // Added uuid import
+let process = require('process');
 
-// We will check the queue frequently for new transactions.
-const PROCESS_INTERVAL_MS = 10 * 1000; // 10 seconds
-// We will only retry a FAILED transaction after a longer delay.
-const RETRY_DELAY_MS = 60 * 1000; // 60 seconds
+// How often the processor checks the queue for new transactions.
+const PROCESS_INTERVAL_MS = 30000; // 30 seconds
+// How long to wait before retrying a failed transaction.
+const RETRY_DELAY_MS = 10000; 
 
 let isProcessing = false; // A lock to prevent multiple cycles from running at once.
-
 /**
  * Sends a single transaction to the /raw-notifications endpoint.
  * @param {object} transaction The transaction object.
@@ -22,13 +23,13 @@ async function sendTransaction(transaction, clientId) {
 
     if (!apiToken) {
         logger.error({ transactionId: transaction.transactionId }, "API token not available. Deferring transaction.");
-        return "FAILED";
+        return { status: "FAILED", transaction };
     }
 
     try {
         const fullApiUrl = `${process.env.API_BASE_URL}/raw-notifications`;
-        logger.info({ transactionId: transaction.transactionId, url: fullApiUrl }, "Sending transaction to API.");
-
+        logger.info({ transactionId: transaction.transactionId, url: fullApiUrl, eventKey: transaction.payload?.client_event_key }, "Sending transaction to API.");
+        logger.debug({ transactionId: transaction.transactionId, eventKeySent: transaction.payload?.client_event_key, payload: transaction.payload }, "Sending transaction payload to API.");
         const response = await fetch(fullApiUrl, {
             method: 'POST',
             headers: {
@@ -40,23 +41,43 @@ async function sendTransaction(transaction, clientId) {
         });
 
         if (response.ok) {
-            logger.info({ transactionId: transaction.transactionId, status: response.status }, "Transaction SUCCESS.");
-            return "SUCCESS";
+            logger.info({ transactionId: transaction.transactionId, status: response.status, eventKey: transaction.payload?.client_event_key }, "Transaction SUCCESS.");
+            return { status: "SUCCESS", transaction };
         }
 
         const errorText = await response.text();
-        if (response.status === 400 || response.status === 422) {
-            logger.warn({ transactionId: transaction.transactionId, status: response.status, response: errorText }, "Transaction rejected by API. Marking as BAD_REQUEST.");
-            return "BAD_REQUEST";
+        const isDuplicateKeyError = (
+            (response.status === 500 || response.status === 409) &&
+            /violates unique constraint|duplicate key|already exists|Integrity constraint violation|Duplicate entry/i.test(errorText)
+        );
+        if (isDuplicateKeyError) {
+            logger.warn({ transactionId: transaction.transactionId, eventKey: transaction.payload?.client_event_key }, "Duplicate key error detected. Will append -doup in processor.");
+            return { status: "DUPLICATE", transaction };
         }
 
-        logger.error({ transactionId: transaction.transactionId, status: response.status, response: errorText }, "Transaction FAILED due to server error. Will retry later.");
-        return "FAILED";
+        if (response.status === 400 || response.status === 422) {
+            logger.warn({ transactionId: transaction.transactionId, status: response.status, response: errorText, eventKey: transaction.payload?.client_event_key }, "Transaction rejected by API. Marking as BAD_REQUEST.");
+            return { status: "BAD_REQUEST", transaction };
+        }
+
+        logger.error({ transactionId: transaction.transactionId, status: response.status, response: errorText, eventKey: transaction.payload?.client_event_key }, "Transaction FAILED due to server error. Will retry later.");
+        return { status: "FAILED", transaction };
 
     } catch (error) {
-        logger.error({ err: error, transactionId: transaction.transactionId }, "Transaction FAILED due to network/fetch error.");
-        return "FAILED";
+        logger.error({ err: error, transactionId: transaction.transactionId, eventKey: transaction.payload?.client_event_key }, "Transaction FAILED due to network/fetch error.");
+        return { status: "FAILED", transaction };
     }
+}
+
+// Helper to append or increment -doup suffix
+function appendDoupSuffix(str) {
+    if (!str) return 'doup';
+    const match = str.match(/-doup(\d+)?$/);
+    if (match) {
+        const num = match[1] ? parseInt(match[1], 10) + 1 : 2;
+        return str.replace(/-doup(\d+)?$/, `-doup${num}`);
+    }
+    return str + '-doup';
 }
 
 /**
@@ -97,17 +118,40 @@ async function runProcessor(clientId) {
 
         // Process all selected transactions in parallel.
         const processingPromises = transactionsToProcess.map(async (trx) => {
-            const finalStatus = await sendTransaction(trx, clientId);
-            const originalTrxInArray = transactions.find(t => t.transactionId === trx.transactionId);
-            if (originalTrxInArray) {
-                originalTrxInArray.status = finalStatus;
-                originalTrxInArray.timestamp = new Date().toISOString(); // Update timestamp on each attempt
+            logger.debug({ transactionId: trx.transactionId, eventKeyBeforeSend: trx.payload?.client_event_key }, "Processing transaction.");
+            let updatedTrx = trx;
+            let finalStatus = null;
+            let attempts = 0;
+            const MAX_DUPLICATE_ATTEMPTS = 5;
+            do {
+                const result = await sendTransaction(updatedTrx, clientId);
+                finalStatus = result.status;
+                updatedTrx = result.transaction;
+                if (finalStatus === "DUPLICATE") {
+                    // Append or increment -doup suffix for both id and client_event_key
+                    if (updatedTrx.payload) {
+                        updatedTrx.payload.id = appendDoupSuffix(updatedTrx.payload.id);
+                        updatedTrx.payload.client_event_key = appendDoupSuffix(updatedTrx.payload.client_event_key);
+                    }
+                    updatedTrx.transactionId = updatedTrx.payload.id;
+                    attempts++;
+                }
+            } while (finalStatus === "DUPLICATE" && attempts < MAX_DUPLICATE_ATTEMPTS);
+            logger.debug({ transactionId: updatedTrx.transactionId, eventKeyAfterSend: updatedTrx.payload?.client_event_key, finalStatus }, "Transaction processed by sendTransaction.");
+
+            // Always remove the old transaction and add the updated one (handles id changes)
+            const oldIndex = transactions.findIndex(t => t.transactionId === trx.transactionId);
+            if (oldIndex !== -1) {
+                transactions.splice(oldIndex, 1);
             }
+            transactions.push({ ...updatedTrx, status: finalStatus, timestamp: new Date().toISOString() });
+            logger.debug({ transactionId: updatedTrx.transactionId, eventKeyAfterUpdate: updatedTrx.payload?.client_event_key }, "Transaction updated in array (handles id changes).");
         });
 
         await Promise.all(processingPromises);
 
         // Save the final results back to the file.
+        logger.debug({ transactionsToSave: transactions.map(t => ({ id: t.transactionId, eventKey: t.payload?.client_event_key, status: t.status })) }, "Saving transactions to file.");
         await transactionStore.saveTransactions(clientId, transactions);
         logger.info("Transaction processing cycle finished.");
 

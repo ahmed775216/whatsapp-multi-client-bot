@@ -271,8 +271,7 @@ function restartClientInstance(clientId) {
 }
 
 function recoverExistingClientInstances() {
-    // ... (نفس الكود مع التأكد من استخدام generateClientId الصحيح للمعرفة الدائمة)
-    ensureClientDataDirExists();
+     ensureClientDataDirExists();
      console.log("[INST_MGR] Scanning for existing client instances to restart...");
     const existingClientFolders = fs.readdirSync(config.CLIENT_DATA_BASE_DIR, { withFileTypes: true })
                                    .filter(dirent => dirent.isDirectory())

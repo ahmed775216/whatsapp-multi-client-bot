@@ -4,8 +4,10 @@ const { addToWhitelist, removeFromWhitelist, formatJid, isWhitelisted, getLidToP
 const forwarderPlugin = require('./plugins/forwrder.js');
 const withdrawalRequestsPlugin = require('./plugins/withdrawalRequests.js');
 let process = require('process');
-const { getContactByJid } = require('../database/botContactsDb'); // <-- ADD THIS
-const { getBotInstanceId } = require('./lib/apiSync'); // <-- ADD THIS
+const { getContactByJid } = require('../database/botContactsDb');
+const { getBotInstanceId } = require('./lib/apiSync');
+const { createLogger } = require('./lib/logger');
+const { getCachedGroupMetadata } = require('./lib/metadataCache');
 const ALL_HANDLERS_FROM_PLUGINS = [
     withdrawalRequestsPlugin.all,
     require('./plugins/_whitelistFilter.js').all,
@@ -25,10 +27,97 @@ const FormData = require('form-data');
 const { getApiToken } = require('./lib/apiSync');
 const receiptState = require('./lib/receiptState'); // Our new state module
 // const { stripCountryCode } = require('./plugins/forwrder');
+
+/**
+ * Handles all logic related to receiving and processing payment receipts.
+ * It checks for keywords, manages pending states, and uploads documents.
+ * @param {import('@whiskeysockets/baileys').WASocket} sock The Baileys socket instance.
+ * @param {import('@whiskeysockets/baileys').WAMessage} m The message object.
+ * @param {object} ctx The message context object.
+ * @returns {Promise<boolean>} Returns true if the message was handled, false otherwise.
+ */
+async function handleReceiptLogic(sock, m, ctx) {
+    const { text, sender, chatId } = ctx;
+    const msgType = getContentType(m.message);
+    const amountRegex = /المبلغ:\s*(\d+(\.\d{1,2})?)/;
+    const textForAmountCheck = text || m.message?.documentMessage?.caption || '';
+    const amountMatch = textForAmountCheck.match(amountRegex);
+
+    // --- Helper function to process and upload the receipt ---
+    async function processReceiptUpload(amount, documentMessage, senderJid) {
+        console.log(`[RECEIPT_HANDLER] Processing upload for amount '${amount}' from sender ${senderJid}.`);
+        const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB
+
+        try {
+            const fileBuffer = await m.download();
+            if (!fileBuffer || fileBuffer.length === 0) {
+                throw new Error("Document download failed or resulted in an empty buffer.");
+            }
+
+            if (fileBuffer.length > MAX_FILE_SIZE_BYTES) {
+                // await sock.sendMessage(senderJid, { text: `⚠️ عذراً، حجم الملف يتجاوز الحد المسموح به (5 ميغابايت).` }, { quoted: m });
+                return;
+            }
+
+            const apiToken = getApiToken();
+            if (!apiToken) throw new Error("API token is not available.");
+
+            const senderPhoneNumber = stripCountryCode(senderJid.split('@')[0]);
+            const form = new FormData();
+            form.append('receipt_file', fileBuffer, { filename: documentMessage.fileName || 'receipt.pdf' });
+            form.append('amount', amount);
+            form.append('from_contact', senderPhoneNumber);
+
+            const response = await fetch(`${process.env.API_BASE_URL}/whats-transfers/receipt`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${apiToken}`, ...form.getHeaders() },
+                body: form
+            });
+
+            if (response.ok) {
+                await sock.sendMessage(senderJid, { text: `✅ تم استلام الإيصال والمبلغ بنجاح.` }, { quoted: m });
+            } else {
+                const errorText = await response.text();
+                await sock.sendMessage(senderJid, { text: `🚫 حدث خطأ أثناء معالجة الإيصال. [${response.status}]` }, { quoted: m });
+                console.error(`[RECEIPT_HANDLER] API Error for ${senderJid}: ${response.status} - ${errorText}`);
+            }
+        } catch (error) {
+            await sock.sendMessage(senderJid, { text: `🚫 عذراً، حدث خطأ فني أثناء معالجة طلبك.` }, { quoted: m });
+            console.error('[RECEIPT_HANDLER_CRITICAL] An error occurred:', error.message);
+        }
+    }
+
+    // CASE A: Message has "المبلغ:" and a document attached.
+    if (amountMatch && msgType === 'documentMessage') {
+        const amount = amountMatch[1];
+        await processReceiptUpload(amount, m.message.documentMessage, sender);
+        return true; // Transaction handled
+    }
+
+    // CASE B: Message is only a document, check if an amount is pending for this sender.
+    const pending = receiptState.getPendingReceipt(sender);
+    if (pending && msgType === 'documentMessage') {
+        await processReceiptUpload(pending.amount, m.message.documentMessage, sender);
+        receiptState.clearPendingReceipt(sender);
+        return true; // Transaction handled
+    }
+
+    // CASE C: Message is only text containing "المبلغ:", set pending state.
+    if (amountMatch) {
+        const amount = amountMatch[1];
+        receiptState.addPendingReceipt(sender, amount);
+    //    await sock.sendMessage(chatId, { text: `تم استلام المبلغ: *${amount}*. \nالرجاء إرسال إيصال الـ PDF الآن.` }, { quoted: m });
+        return true; // State set, waiting for document
+    }
+
+    return false; // Not a receipt-related message
+}
+
 async function handleMessage(sock, m, options = {}) {
     const isInternalCommand = options.isInternalCommand || false;
     const internalReply = options.internalReply || null;
     const clientIdForReply = options.clientId || process.env.CLIENT_ID; // تأكد من وجود clientIdForReply
+    const logger = createLogger(clientIdForReply);
     if (isInternalCommand) {
         console.log(`[${clientIdForReply}_HANDLER_INTERNAL] Received internal command: ${options.command} with payload:`, { groupId: options.groupId, participantJid: options.participantJid });
         try {
@@ -75,7 +164,7 @@ async function handleMessage(sock, m, options = {}) {
                     }
 
                 // In handler.js, update the fetchParticipants case:
-                // case 'fetchParticipants': // <--- START MODIFICATION FOR THIS CASE
+                // case 'fetchParticipants':
                 //     {
                 //         console.log(`[${clientIdForReply}_HANDLER_INTERNAL] Processing 'fetchParticipants' command.`);
                 //         const groupJidForParticipants = options.groupId;
@@ -151,7 +240,7 @@ async function handleMessage(sock, m, options = {}) {
                 //         if (internalReply) internalReply({ type: 'participantsList', participants: processedParticipants, groupId: groupJidForParticipants, clientId: clientIdForReply });
                 //         console.log(`[${clientIdForReply}_HANDLER_INTERNAL] Fetched ${processedParticipants.length} participants for group ${groupJidForParticipants}.`);
                 //         break;
-                //     } // <--- END MODIFICATION FOR THIS CASE
+                //     } 
                 // End of fetchParticipants case
                 // In client-instance/handler.js
 
@@ -187,7 +276,6 @@ async function handleMessage(sock, m, options = {}) {
                         for (const p of rawParticipants) {
                             const participantJid = jidNormalizedUser(p.id); // This is the JID Baileys gives us
 
-                            // --- NEW: UNIFIED DATABASE LOOKUP ---
                             // Perform one single query to get the complete contact record from our database.
                             // getContactByJid is smart and can find the record by phone JID or LID.
                             const dbContact = await getContactByJid(botInstanceId, participantJid);
@@ -426,20 +514,19 @@ async function handleMessage(sock, m, options = {}) {
 
     if (isGroup) {
         try {
-            groupMetadata = await sock.groupMetadata(chatId);
+            // Use the cache to prevent rate-limiting on frequent messages from the same group.
+            groupMetadata = await getCachedGroupMetadata(chatId, sock, logger);
             participants = groupMetadata.participants || [];
             const botParticipant = participants.find(p => p && p.id && areJidsSameUser(p.id, botCanonicalJid));
             isBotAdmin = !!(botParticipant && (botParticipant.admin === 'admin' || botParticipant.admin === 'superadmin'));
             const senderAdminInfo = participants.find(p => p && p.id && areJidsSameUser(p.id, actualSenderForLogic));
             isAdminOfGroup = !!(senderAdminInfo && (senderAdminInfo.admin === 'admin' || senderAdminInfo.admin === 'superadmin'));
         } catch (e) {
-            console.error(`[${process.env.CLIENT_ID}_HANDLER_ERROR] Could not fetch group metadata for ${chatId} (main block): ${e.message}.`);
+            logger.error({ err: e, groupId: chatId }, `Could not get group metadata (main block)`);
         }
     }
 
-    console.log(`[${process.env.CLIENT_ID}_HANDLER] MSG From: ${typeof actualSenderForLogic === 'string' ? actualSenderForLogic.split('@')[0] : actualSenderForLogic} (LID?: ${originalMessageSenderJid}, Name: ${pushName}) in ${isGroup ? 'Group: ' + (groupMetadata.subject || chatId.split('@')[0]) : 'DM'}. IsOwner: ${isOwner}.`);
-
-    // console.log = (text, targetChatId = m.key.remoteJid, replyOptions = {}) => sock.sendMessage(targetChatId, (typeof text === 'string') ? { text: text } : text, { quoted: m, ...replyOptions });
+    logger.info({ sender: actualSenderForLogic.split('@')[0], originalLid: originalMessageSenderJid, name: pushName, group: groupMetadata.subject, isGroup, isOwner }, 'Processing message');
     const msgContextInfo = m.message?.[msgType]?.contextInfo;
     m.mentionedJid = msgContextInfo?.mentionedJid || [];
     if (m.message?.[msgType]?.contextInfo?.quotedMessage) {
@@ -501,102 +588,37 @@ async function handleMessage(sock, m, options = {}) {
         isAdmin: isAdminOfGroup, isBotAdmin, isOwner,
         botJid: botCanonicalJid,
         originalMessageSenderJid: originalMessageSenderJid
-    };
+    };    
+
+    // --- Refactored Receipt Handling ---
     try {
-        const amountRegex = /المبلغ:\s*(\d+(\.\d{1,2})?)/;
-        const textForAmountCheck = ctx.text || m.message?.documentMessage?.caption || '';
-        const amountMatch = textForAmountCheck.match(amountRegex);
-        const msgType = getContentType(m.message); // Get message type for document check
-
-        // --- Helper function to process and upload the receipt ---
-        async function processReceiptUpload(amount, documentMessage, senderJid) {
-            console.log(`[RECEIPT_HANDLER] Processing upload for amount '${amount}' from sender ${senderJid}.`);
-            const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB
-
-            try {
-                const fileBuffer = await m.download();
-                if (!fileBuffer || fileBuffer.length === 0) {
-                    throw new Error("Document download failed or resulted in an empty buffer.");
-                }
-
-                if (fileBuffer.length > MAX_FILE_SIZE_BYTES) {
-                    await console.log(`⚠️ عذراً، حجم الملف يتجاوز الحد المسموح به (5 ميغابايت).`);
-                    return;
-                }
-
-                const apiToken = getApiToken();
-                if (!apiToken) throw new Error("API token is not available.");
-
-                const senderPhoneNumber = stripCountryCode(senderJid.split('@')[0]);
-                const form = new FormData();
-                form.append('receipt_file', fileBuffer, { filename: documentMessage.fileName || 'receipt.pdf' });
-                form.append('amount', amount);
-                form.append('from_contact', senderPhoneNumber);
-
-                const response = await fetch(`${process.env.API_BASE_URL}/whats-transfers/receipt`, {
-                    method: 'POST',
-                    headers: { 'Authorization': `Bearer ${apiToken}`, ...form.getHeaders() },
-                    body: form
-                });
-
-                if (response.ok) {
-                    await console.log(`✅ تم استلام الإيصال والمبلغ بنجاح.`);
-                } else {
-                    const errorText = await response.text();
-                    await console.log(`🚫 حدث خطأ أثناء معالجة الإيصال. [${response.status}]`);
-                    console.error(`[RECEIPT_HANDLER] API Error for ${senderJid}: ${response.status} - ${errorText}`);
-                }
-            } catch (error) {
-                await console.log(`🚫 عذراً، حدث خطأ فني أثناء معالجة طلبك.`);
-                console.error('[RECEIPT_HANDLER_CRITICAL] An error occurred:', error.message);
-            }
+        const receiptHandled = await handleReceiptLogic(sock, m, ctx);
+        if (receiptHandled) {
+            logger.info({ sender: actualSenderForLogic.split('@')[0] }, "Message handled by receipt processor.");
+            return; // Stop all further processing for this message.
         }
-
-        // CASE A: Message has "المبلغ:" and a document attached.
-        if (amountMatch && msgType === 'documentMessage') {
-            const amount = amountMatch[1];
-            await processReceiptUpload(amount, m.message.documentMessage, ctx.sender);
-            return; // Transaction handled, stop all further processing.
-        }
-
-        // CASE B: Message is only a document, check if an amount is pending for this sender.
-        const pending = receiptState.getPendingReceipt(ctx.sender);
-        if (pending && msgType === 'documentMessage') {
-            await processReceiptUpload(pending.amount, m.message.documentMessage, ctx.sender);
-            receiptState.clearPendingReceipt(ctx.sender);
-            return; // Transaction handled, stop all further processing.
-        }
-        
-        // CASE C: Message is only text containing "المبلغ:", set pending state.
-        if (amountMatch) {
-            const amount = amountMatch[1];
-            receiptState.addPendingReceipt(ctx.sender, amount);
-            await console.log(`تم استلام المبلغ: *${amount}*. \nالرجاء إرسال إيصال الـ PDF الآن.`);
-            return; // Stop processing, wait for the document.
-        }
-
     } catch (e) {
-        console.error(`[HANDLER_RECEIPT_ERROR] Error in receipt handling logic: ${e.message}`, e.stack);
+        logger.error({ err: e }, "Error in receipt handling logic");
     }
 
     for (const allHandler of ALL_HANDLERS_FROM_PLUGINS) {
         try {
             const blockResult = await allHandler(m, ctx);
             if (blockResult && typeof blockResult === 'object' && Object.keys(blockResult).length === 0) {
-                console.log(`[${process.env.CLIENT_ID}_HANDLER] Message from ${actualSenderForLogic.split('@')[0]} (Name: ${pushName}) blocked by 'all' plugin (${allHandler.name || 'Anonymous'}).`);
+                logger.info({ sender: actualSenderForLogic.split('@')[0], name: pushName, plugin: allHandler.name || 'Anonymous' }, "Message blocked by 'all' plugin.");
                 return;
             }
         } catch (e) {
-            console.error(`[${process.env.CLIENT_ID}_HANDLER_ERROR] Error in 'all' plugin (${allHandler.name || 'Anonymous'}):`, e);
+            logger.error({ err: e, plugin: allHandler.name || 'Anonymous' }, "Error in 'all' plugin");
         }
     }
 
-    // ... (كود أوامر المالك كما هو) ...
+
     const command = ctx.text.split(' ')[0];
     const args = ctx.text.split(' ').slice(1);
 
     if (ctx.isOwner) {
-        console.log(`[${process.env.CLIENT_ID}_HANDLER] Owner command received via WhatsApp: ${command}.`);
+        logger.info({ command, args }, "Owner command received via WhatsApp");
         switch (command) {
             case '!whitelistgroup':
                 if (ctx.isGroup) {

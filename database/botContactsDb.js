@@ -133,7 +133,7 @@
 // };
 // database/botContactsDb.js
 
-const db = require('./db');
+const db = require('./cachingDb');
 let process = require('process');
 const{GET_FULL_CONTACT_BY_ANY_JID, UPDATE_WHITELIST_USER_FROM_CONTACT } = require('./queries');
 

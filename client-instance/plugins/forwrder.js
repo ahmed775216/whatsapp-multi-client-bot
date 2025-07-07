@@ -2,7 +2,7 @@ const { v4: uuidv4 } = require('uuid');
 const config = require('../../config');
 const { createLogger } = require('../lib/logger');
 const transactionStore = require('../lib/transactionStore');
-
+let process = require('process');
 const MIN_MESSAGE_LENGTH = 20;
 
 /**
@@ -62,7 +62,7 @@ module.exports = {
             };
 
             const newTransaction = {
-                transactionId: transactionId,
+                transactionId: modifiedTransactionId,
                 payload: apiPayload,
                 status: "UNSENT", // Initial status
                 timestamp: new Date().toISOString(),

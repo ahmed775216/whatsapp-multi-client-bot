@@ -5,15 +5,11 @@ const { createLogger } = require('./logger');
 
 const filePathCache = new Map();
 
-/**
- * Gets the standardized path for a client's transactions.json file.
- * @param {string} clientId The client's unique identifier.
- * @returns {string} The full path to the transactions file.
- */
 function getTransactionFilePath(clientId) {
     if (filePathCache.has(clientId)) {
         return filePathCache.get(clientId);
     }
+    // eslint-disable-next-line no-undef
     const dataDir = path.join(__dirname, '..', '..', 'Data', clientId);
     const filePath = path.join(dataDir, 'transactions.json');
     filePathCache.set(clientId, filePath);
@@ -21,100 +17,101 @@ function getTransactionFilePath(clientId) {
 }
 
 /**
- * Ensures a file exists before locking. If it doesn't, it creates an empty file.
- * @param {string} filePath The full path to the file.
+ * Ensures the directory for the transaction file exists.
+ * @param {string} filePath The full path to the transactions file.
  */
-async function ensureFileExists(filePath) {
-    try {
-        await fs.access(filePath);
-    } catch (error) {
-        if (error.code === 'ENOENT') {
-            // File doesn't exist, create its directory and an empty JSON array file.
-            await fs.mkdir(path.dirname(filePath), { recursive: true });
-            await fs.writeFile(filePath, '[]', 'utf-8'); // Create with an empty array
-        } else {
-            throw error; // Re-throw other errors
-        }
-    }
+async function ensureDirectoryExists(filePath) {
+    const dirPath = path.dirname(filePath);
+    await fs.mkdir(dirPath, { recursive: true });
 }
 
 /**
- * Safely reads all transactions from a client's JSON file.
- * @param {string} clientId The client's unique identifier.
- * @returns {Promise<Array<object>>} An array of transaction objects.
- */
-async function getTransactions(clientId) {
-    const logger = createLogger(clientId);
-    const filePath = getTransactionFilePath(clientId);
-
-    try {
-        await ensureFileExists(filePath); // <-- FIX: Make sure file exists first
-        const release = await lockfile.lock(filePath, { retries: 5 });
-        try {
-            const fileContent = await fs.readFile(filePath, 'utf-8');
-            return JSON.parse(fileContent);
-        } finally {
-            await release();
-        }
-    } catch (error) {
-        logger.error({ err: error }, 'A critical error occurred while reading transactions file.');
-        throw error;
-    }
-}
-
-/**
- * Safely overwrites the transactions file with a new set of transactions.
- * @param {string} clientId The client's unique identifier.
- * @param {Array<object>} transactions The new array of transaction objects to save.
- */
-async function saveTransactions(clientId, transactions) {
-    const logger = createLogger(clientId);
-    const filePath = getTransactionFilePath(clientId);
-
-    try {
-        await ensureFileExists(filePath); // <-- FIX: Make sure file exists first
-        const release = await lockfile.lock(filePath, { retries: 5 });
-        try {
-            await fs.writeFile(filePath, JSON.stringify(transactions, null, 2), 'utf-8');
-        } finally {
-            await release();
-        }
-    } catch (error) {
-        logger.error({ err: error }, 'A critical error occurred while saving transactions file.');
-        throw error;
-    }
-}
-
-/**
- * Safely adds a single new transaction to the end of the transactions file.
- * @param {string} clientId The client's unique identifier.
- * @param {object} newTransaction The new transaction object to add.
+ * Safely appends a single transaction to the file.
+ * @param {string} clientId
+ * @param {object} newTransaction
  */
 async function addTransaction(clientId, newTransaction) {
     const logger = createLogger(clientId);
     const filePath = getTransactionFilePath(clientId);
+    const transactionString = JSON.stringify(newTransaction) + '\n'; // Add newline
 
     try {
-        await ensureFileExists(filePath); // <-- FIX: Make sure file exists first
+        await ensureDirectoryExists(filePath);
+        // Use fs.appendFile, which is an atomic operation for this purpose.
+        // It's much safer than read-modify-write.
+        await fs.appendFile(filePath, transactionString, 'utf-8');
+        logger.info({ transactionId: newTransaction.transactionId }, 'Successfully appended new transaction to log.');
+    } catch (error) {
+        logger.error({ err: error, transactionId: newTransaction.transactionId }, 'Failed to append transaction to log.');
+    }
+}
+
+/**
+ * Reads all transactions from the NDJSON file.
+ * @param {string} clientId
+ * @returns {Promise<Array<object>>}
+ */
+async function getTransactions(clientId) {
+    const logger = createLogger(clientId);
+    const filePath = getTransactionFilePath(clientId);
+    try {
+        await fs.access(filePath); // Check if file exists
+        const fileContent = await fs.readFile(filePath, 'utf-8');
+        if (!fileContent.trim()) return []; // Handle empty file
+
+        const transactions = [];
+        const lines = fileContent.trim().split('\n');
+
+        for (const line of lines) {
+            const trimmedLine = line.trim();
+            if (!trimmedLine) continue; // Skip empty or whitespace-only lines
+            try {
+                transactions.push(JSON.parse(trimmedLine));
+            } catch (parseError) {
+                // If a single line is corrupt, log it and skip it instead of crashing.
+                logger.warn({ err: parseError, line }, 'Skipping malformed line in transaction file.');
+            }
+        }
+        return transactions;
+    } catch (error) {
+        if (error.code === 'ENOENT') {
+            return []; // File doesn't exist, which is fine.
+        }
+        logger.error({ err: error }, 'Failed to read transactions file.');
+        throw error; // Re-throw other errors
+    }
+}
+
+/**
+ * Overwrites the transaction file with a new set of transactions (for compaction).
+ * This function acquires a lock to prevent conflicts with addTransaction.
+ * @param {string} clientId
+ * @param {Array<object>} transactions
+ */
+async function saveTransactions(clientId, transactions) {
+    const logger = createLogger(clientId);
+    const filePath = getTransactionFilePath(clientId);
+    
+    // Convert the array back to newline-delimited JSON string
+    const newContent = transactions.map(t => JSON.stringify(t)).join('\n') + (transactions.length > 0 ? '\n' : '');
+
+    // logger.debug({ action: "Saving transactions", count: transactions.length, transactions: transactions.map(t => ({ id: t.transactionId, eventKey: t.payload?.client_event_key, status: t.status })) }, "Attempting to save transactions.");
+
+    try {
+        await ensureDirectoryExists(filePath);
         const release = await lockfile.lock(filePath, { retries: 5 });
         try {
-            // Now that we know the file exists, we can safely read it.
-            const fileContent = await fs.readFile(filePath, 'utf-8');
-            const transactions = JSON.parse(fileContent);
-            transactions.push(newTransaction);
-            await fs.writeFile(filePath, JSON.stringify(transactions, null, 2), 'utf-8');
-            logger.info({ transactionId: newTransaction.transactionId }, 'Successfully added new transaction to store.');
+            await fs.writeFile(filePath, newContent, 'utf-8');
         } finally {
             await release();
         }
     } catch (error) {
-        logger.error({ err: error, transactionId: newTransaction.transactionId }, 'Failed to add transaction to store.');
-        throw error;
+        logger.error({ err: error }, 'Failed to save/compact transactions file.');
     }
 }
 
 module.exports = {
+    addTransaction,
     getTransactions,
     saveTransactions,
-    addTransaction,
 };
